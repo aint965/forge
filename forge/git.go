@@ -22,10 +22,55 @@ const (
 	pktEnd   = "0002"
 )
 
+// appendPktLen appends the 4-hex-digit pkt-line length prefix for a payload
+// of n bytes (length counts the 4 prefix bytes themselves).
+func appendPktLen(out []byte, n int) []byte {
+	const hexdigits = "0123456789abcdef"
+	total := n + 4
+	if total > 0xffff {
+		// Unreachable for the short text lines pktLine frames; keep the
+		// old formatting for absurd lengths rather than truncating.
+		return append(out, []byte(fmt.Sprintf("%04x", total))...)
+	}
+	return append(out,
+		hexdigits[(total>>12)&0xf],
+		hexdigits[(total>>8)&0xf],
+		hexdigits[(total>>4)&0xf],
+		hexdigits[total&0xf])
+}
+
 // pktLine frames one payload (which should end with "\n" for text lines).
 func pktLine(payload string) []byte {
-	n := len(payload) + 4
-	return []byte(fmt.Sprintf("%04x%s", n, payload))
+	out := make([]byte, 0, len(payload)+4)
+	out = appendPktLen(out, len(payload))
+	return append(out, payload...)
+}
+
+// parsePktLen parses a 4-byte hex pkt-line length without allocating. A
+// leading sign falls back to ParseInt to preserve its exact acceptance.
+func parsePktLen(hdr []byte) (int, bool) {
+	if len(hdr) != 4 {
+		return 0, false
+	}
+	if hdr[0] == '+' || hdr[0] == '-' {
+		n, err := strconv.ParseInt(string(hdr), 16, 32)
+		return int(n), err == nil
+	}
+	n := 0
+	for _, c := range hdr {
+		n <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			n |= int(c - '0')
+		case c >= 'a' && c <= 'f':
+			n |= int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			n |= int(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return n, true
 }
 
 func pktFlushBytes() []byte { return []byte(pktFlush) }
@@ -43,25 +88,25 @@ func decodePktLines(b []byte) ([]pktPacket, int, error) {
 	var out []pktPacket
 	off := 0
 	for off+4 <= len(b) {
-		hdr := string(b[off : off+4])
-		if hdr == pktFlush {
+		hdr := b[off : off+4]
+		if string(hdr) == pktFlush {
 			out = append(out, pktPacket{kind: 'f'})
 			off += 4
 			continue
 		}
-		if hdr == pktDelim {
+		if string(hdr) == pktDelim {
 			out = append(out, pktPacket{kind: 'd'})
 			off += 4
 			continue
 		}
-		if hdr == pktEnd {
+		if string(hdr) == pktEnd {
 			out = append(out, pktPacket{kind: 'e'})
 			off += 4
 			continue
 		}
-		n, err := strconv.ParseInt(hdr, 16, 32)
-		if err != nil || n < 4 {
-			return out, off, fmt.Errorf("bad pkt-line length %q", hdr)
+		n, ok := parsePktLen(hdr)
+		if !ok || n < 4 {
+			return out, off, fmt.Errorf("bad pkt-line length %q", string(hdr))
 		}
 		if off+int(n) > len(b) {
 			return out, off, fmt.Errorf("pkt-line of %d bytes overruns the stream", n)
@@ -111,7 +156,7 @@ func sidebandWrap(band byte, data []byte) []byte {
 		chunk := data[:n]
 		data = data[n:]
 		pkt := make([]byte, 0, n+5)
-		pkt = append(pkt, []byte(fmt.Sprintf("%04x", n+5))...)
+		pkt = appendPktLen(pkt, n+1)
 		pkt = append(pkt, band)
 		pkt = append(pkt, chunk...)
 		out = append(out, pkt...)
@@ -578,14 +623,14 @@ func handleReceivePackPOST(r *repository, body []byte) ([]byte, string, int) {
 	sawFlush := false
 	off := 0
 	for off+4 <= len(body) {
-		hdr := string(body[off : off+4])
-		if hdr == pktFlush {
+		hdr := body[off : off+4]
+		if string(hdr) == pktFlush {
 			off += 4
 			sawFlush = true
 			break
 		}
-		n, err := strconv.ParseInt(hdr, 16, 32)
-		if err != nil || n < 4 || off+int(n) > len(body) {
+		n, ok := parsePktLen(hdr)
+		if !ok || n < 4 || off+n > len(body) {
 			return []byte("bad pkt-line stream"), "text/plain", 400
 		}
 		raw := strings.TrimRight(string(body[off+4:off+int(n)]), "\n")

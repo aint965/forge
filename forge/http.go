@@ -24,9 +24,26 @@ type request struct {
 	headers map[string]string // lowercased names, first value wins
 	body    []byte
 	host    string
+
+	segs     []string // memoized segments(); valid once segsDone is set
+	segsDone bool
 }
 
-func (q *request) header(name string) string { return q.headers[strings.ToLower(name)] }
+func (q *request) header(name string) string {
+	// Header names are stored lowercased; skip the lowercasing allocation
+	// when the caller already passed a lowercase name.
+	lower := true
+	for i := 0; i < len(name); i++ {
+		if name[i] >= 'A' && name[i] <= 'Z' {
+			lower = false
+			break
+		}
+	}
+	if lower {
+		return q.headers[name]
+	}
+	return q.headers[strings.ToLower(name)]
+}
 
 // queryValue answers the first value of a query parameter.
 func (q *request) queryValue(name string) string {
@@ -54,8 +71,13 @@ func (q *request) queryInt(name string, def int) int {
 	return def
 }
 
-// segments splits the path into decoded segments.
+// segments splits the path into decoded segments. The split is memoized:
+// dispatch and the handler both ask for the segments of the same request.
 func (q *request) segments() []string {
+	if q.segsDone {
+		return q.segs
+	}
+	q.segsDone = true
 	trimmed := strings.Trim(q.path, "/")
 	if trimmed == "" {
 		return nil
@@ -64,6 +86,7 @@ func (q *request) segments() []string {
 	for i, p := range parts {
 		parts[i] = unescape(p)
 	}
+	q.segs = parts
 	return parts
 }
 
