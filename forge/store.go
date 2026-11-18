@@ -13,12 +13,15 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"fmt"
+	"hash"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
+
+var sha1Pool = sync.Pool{New: func() any { return sha1.New() }}
 
 // ---------------------------------------------------------------------------
 // Object ids and object types
@@ -69,12 +72,23 @@ func typeName(t byte) string {
 }
 
 // hashObjectId is SHA-1 over "<type> <size>\0" + data, the git object id.
+// The header is built in a stack buffer and the hash comes from a pool: the
+// fmt.Fprintf form allocated on every object stored.
 func hashObjectId(typ byte, data []byte) Oid {
-	h := sha1.New()
-	fmt.Fprintf(h, "%s %d\x00", typeName(typ), len(data))
+	h := sha1Pool.Get().(hash.Hash)
+	h.Reset()
+	var hdr [32]byte
+	n := copy(hdr[:], typeName(typ))
+	hdr[n] = ' '
+	n++
+	n += len(strconv.AppendInt(hdr[n:n], int64(len(data)), 10))
+	hdr[n] = 0
+	n++
+	h.Write(hdr[:n])
 	h.Write(data)
 	var o Oid
 	copy(o[:], h.Sum(nil))
+	sha1Pool.Put(h)
 	return o
 }
 
@@ -399,7 +413,10 @@ func (s *store) nextTime() int64 {
 
 // nextRequestID answers a fresh X-GitHub-Request-Id value.
 func (s *store) nextRequestID() string {
-	return fmt.Sprintf("req-%d", s.reqSeq.Add(1))
+	var buf [24]byte
+	b := append(buf[:0], "req-"...)
+	b = strconv.AppendUint(b, s.reqSeq.Add(1), 10)
+	return string(b)
 }
 
 // createRepo makes a repository owned by owner. It answers nil when a

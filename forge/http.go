@@ -116,6 +116,12 @@ func (s *server) serve(ln net.Listener) {
 		if err != nil {
 			return
 		}
+		// Disable Nagle: the workloads are small request/response exchanges,
+		// and a delayed ACK interacting with Nagle stalls each one. The
+		// net/http server does the same for its connections.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
 		go s.serveConn(conn)
 	}
 }
@@ -317,24 +323,35 @@ func writeResponse(bw *bufio.Writer, resp response, keepAlive bool) {
 	if reason == "" {
 		reason = "Status"
 	}
-	var h strings.Builder
-	fmt.Fprintf(&h, "HTTP/1.1 %d %s\r\n", resp.status, reason)
+	h := make([]byte, 0, 256)
+	h = append(h, "HTTP/1.1 "...)
+	h = strconv.AppendInt(h, int64(resp.status), 10)
+	h = append(h, ' ')
+	h = append(h, reason...)
+	h = append(h, "\r\n"...)
 	if resp.contentType != "" {
-		fmt.Fprintf(&h, "Content-Type: %s\r\n", resp.contentType)
+		h = append(h, "Content-Type: "...)
+		h = append(h, resp.contentType...)
+		h = append(h, "\r\n"...)
 	}
 	if resp.status != 204 {
-		fmt.Fprintf(&h, "Content-Length: %d\r\n", len(resp.body))
+		h = append(h, "Content-Length: "...)
+		h = strconv.AppendInt(h, int64(len(resp.body)), 10)
+		h = append(h, "\r\n"...)
 	}
 	if keepAlive {
-		h.WriteString("Connection: keep-alive\r\n")
+		h = append(h, "Connection: keep-alive\r\n"...)
 	} else {
-		h.WriteString("Connection: close\r\n")
+		h = append(h, "Connection: close\r\n"...)
 	}
 	for k, v := range resp.headers {
-		fmt.Fprintf(&h, "%s: %s\r\n", k, v)
+		h = append(h, k...)
+		h = append(h, ": "...)
+		h = append(h, v...)
+		h = append(h, "\r\n"...)
 	}
-	h.WriteString("\r\n")
-	bw.WriteString(h.String())
+	h = append(h, "\r\n"...)
+	bw.Write(h)
 	if resp.status != 204 {
 		bw.Write(resp.body)
 	}

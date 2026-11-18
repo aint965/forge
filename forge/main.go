@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,13 @@ func main() {
 }
 
 func run() error {
+	// The contest runs the entry under a 2-CPU limit, but Go 1.24 sizes
+	// GOMAXPROCS from the host's CPU count, which the sandbox does not
+	// restrict: on a many-core host the scheduler and the GC would run
+	// dozens of threads on 2 real CPUs. Cap it at the contest's limit.
+	if runtime.NumCPU() > 2 {
+		runtime.GOMAXPROCS(2)
+	}
 	st := newStore()
 	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
 	srv := newServer(st, token)
