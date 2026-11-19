@@ -1,29 +1,28 @@
-// Entry point: start the forge binary that lives beside this file and wait
-// for it. The binary binds its own ephemeral port, registers with the grading
-// environment, serves, polls /done, and exits 0; this process exits with the
-// same code the binary does.
-
 import { spawn } from "node:child_process";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const binary = join(here, "forge-bin");
+const entryDirectory = dirname(fileURLToPath(import.meta.url));
+const executable = resolve(entryDirectory, "forge-bin");
 
-const child = spawn(binary, [], {
-  stdio: "inherit",
+const child = spawn(executable, process.argv.slice(2), {
+  cwd: entryDirectory,
   env: process.env,
+  stdio: "inherit",
 });
 
-child.on("error", (err: Error) => {
-  process.stderr.write(`forge-bin failed to start: ${err.message}\n`);
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(signal, () => child.kill(signal));
+}
+
+child.once("error", (error: Error) => {
+  process.stderr.write(`forge-bin failed to start: ${error.message}\n`);
   process.exit(1);
 });
 
-child.on("exit", (code: number | null, signal: string | null) => {
-  if (signal !== null) {
+child.once("exit", (code: number | null, signal: string | null) => {
+  if (signal) {
     process.stderr.write(`forge-bin stopped on ${signal}\n`);
-    process.exit(1);
   }
   process.exit(code ?? 1);
 });
