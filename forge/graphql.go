@@ -1215,6 +1215,7 @@ func resolveCloseIssue(e *gqlExecutor, obj any, args map[string]any) (any, error
 		return nil, fmt.Errorf("no issue matches issueId %q", issueID)
 	}
 	ref.issue.state = "closed"
+	ref.issue.invalidateView()
 	return &gqlNode{typ: "CloseIssuePayload", val: &gqlNode{typ: "Issue", val: ref}}, nil
 }
 

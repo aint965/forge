@@ -230,14 +230,16 @@ type comment struct {
 }
 
 type issue struct {
-	number   int
-	id       int // globally unique REST id
-	title    string
-	body     string
-	state    string // "open" or "closed"
-	labels   []string
-	comments []*comment
-	seq      int // creation order within the repository
+	number    int
+	id        int // globally unique REST id
+	title     string
+	body      string
+	state     string // "open" or "closed"
+	labels    []string
+	comments  []*comment
+	seq       int // creation order within the repository
+	viewMu    sync.Mutex
+	viewCache []byte // cached JSON for the hot GET issue representation
 }
 
 type pullRequest struct {

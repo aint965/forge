@@ -237,6 +237,24 @@ func (s *server) issueView(r *repository, it *issue) issueJSON {
 	}
 }
 
+// issueResponse caches the immutable JSON body used by the hot issue GET path.
+// Callers hold the repository lock; mutating paths clear viewCache before the
+// next read observes the changed issue.
+func (s *server) issueResponse(r *repository, it *issue) response {
+	it.viewMu.Lock()
+	defer it.viewMu.Unlock()
+	if it.viewCache == nil {
+		it.viewCache = mustJSON(s.issueView(r, it))
+	}
+	return jsonResponse(200, it.viewCache)
+}
+
+func (it *issue) invalidateView() {
+	it.viewMu.Lock()
+	it.viewCache = nil
+	it.viewMu.Unlock()
+}
+
 type commentJSON struct {
 	ID        int      `json:"id"`
 	Body      string   `json:"body"`
@@ -1041,6 +1059,10 @@ func (s *server) handleIssues(q *request, owner, name string, tail []string) res
 			if missing, invalid := applyIssuePatch(r, it, patch); invalid {
 				return missingLabel(missing)
 			}
+			it.invalidateView()
+		}
+		if !write {
+			return s.issueResponse(r, it)
 		}
 		return restJSON(200, s.issueView(r, it))
 	})
@@ -1138,6 +1160,7 @@ func (s *server) handleComments(q *request, key repoRoute, number int) response 
 		}
 		text, _ := strField(body, "body")
 		return s.withIssue(key, number, true, func(r *repository, it *issue) response {
+			it.invalidateView()
 			return restJSON(201, commentView(s.viewerJSON(), s.st.addComment(r, it, text)))
 		})
 	}
