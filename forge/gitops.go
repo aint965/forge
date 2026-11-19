@@ -5,8 +5,10 @@
 package main
 
 import (
-	"fmt"
-	"sort"
+	"bytes"
+	"maps"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -15,46 +17,80 @@ import (
 
 // buildCommitObject serialises a commit and stores it, answering its id.
 func (r *repository) buildCommitObject(tree Oid, parents []Oid, message, author, committer string, timestamp int64) Oid {
-	var b strings.Builder
-	fmt.Fprintf(&b, "tree %s\n", tree.String())
-	for _, p := range parents {
-		fmt.Fprintf(&b, "parent %s\n", p.String())
+	data := make([]byte, 0, 96+48*len(parents)+len(author)+len(committer)+len(message))
+	data = appendOidHeader(data, "tree ", tree)
+	for _, parent := range parents {
+		data = appendOidHeader(data, "parent ", parent)
 	}
-	fmt.Fprintf(&b, "author %s %d +0000\n", author, timestamp)
-	fmt.Fprintf(&b, "committer %s %d +0000\n", committer, timestamp)
-	b.WriteString("\n")
-	b.WriteString(message)
+	data = appendIdentityHeader(data, "author ", author, timestamp)
+	data = appendIdentityHeader(data, "committer ", committer, timestamp)
+	data = append(append(data, '\n'), message...)
 	if !strings.HasSuffix(message, "\n") {
-		b.WriteString("\n")
+		data = append(data, '\n')
 	}
-	return r.putObject(objCommit, []byte(b.String()))
+	return r.putObject(objCommit, data)
+}
+
+func appendOidHeader(dst []byte, key string, oid Oid) []byte {
+	return append(oid.appendHex(append(dst, key...)), '\n')
+}
+
+func appendIdentityHeader(dst []byte, key, identity string, timestamp int64) []byte {
+	dst = append(dst, key...)
+	dst = append(dst, identity...)
+	dst = strconv.AppendInt(append(dst, ' '), timestamp, 10)
+	return append(dst, " +0000\n"...)
 }
 
 // buildTreeObject serialises a tree from sorted entries and stores it.
 func (r *repository) buildTreeObject(entries []treeEntry) Oid {
-	sortTreeEntries(entries)
-	var b []byte
-	for _, e := range entries {
-		b = append(b, []byte(e.mode+" "+e.name+"\x00")...)
-		b = append(b, e.oid[:]...)
+	slices.SortStableFunc(entries, compareTreeEntries)
+	var size int
+	for _, entry := range entries {
+		size += len(entry.mode) + len(entry.name) + 2 + len(entry.oid)
 	}
-	return r.putObject(objTree, b)
+	data := make([]byte, 0, size)
+	for _, entry := range entries {
+		data = append(data, entry.mode...)
+		data = append(data, ' ')
+		data = append(data, entry.name...)
+		data = append(data, 0)
+		data = append(data, entry.oid[:]...)
+	}
+	return r.putObject(objTree, data)
 }
 
-// sortTreeEntries orders entries the way git does: by name, with directories
-// compared as if their name had a trailing slash.
-func sortTreeEntries(entries []treeEntry) {
-	sort.SliceStable(entries, func(i, j int) bool {
-		a, b := entries[i], entries[j]
-		an, bn := a.name, b.name
-		if a.isDir() {
-			an += "/"
+// Compare the serialized name order, treating directory names as if they
+// include a trailing slash. The slash is virtual to avoid an allocation.
+func compareTreeEntries(a, b treeEntry) int {
+	aLen, bLen := len(a.name), len(b.name)
+	common := min(aLen, bLen)
+	if order := strings.Compare(a.name[:common], b.name[:common]); order != 0 {
+		return order
+	}
+	if aLen == bLen {
+		switch {
+		case a.isDir() && !b.isDir():
+			return 1
+		case b.isDir() && !a.isDir():
+			return -1
+		default:
+			return 0
 		}
-		if b.isDir() {
-			bn += "/"
-		}
-		return an < bn
-	})
+	}
+	if aLen > bLen {
+		return -compareTreeEntries(b, a)
+	}
+	if !a.isDir() {
+		return -1
+	}
+	if next := b.name[common]; next != '/' {
+		return int('/') - int(next)
+	}
+	if bLen == aLen+1 && !b.isDir() {
+		return 0
+	}
+	return -1
 }
 
 // flatFile is one file in a flattened tree.
@@ -66,115 +102,113 @@ type flatFile struct {
 // flattenTree walks a tree recursively into path -> file. Missing trees yield
 // an empty map.
 func (r *repository) flattenTree(treeOid Oid) map[string]flatFile {
-	out := map[string]flatFile{}
-	var walk func(oid Oid, prefix string)
-	walk = func(oid Oid, prefix string) {
-		o := r.objects[oid]
-		if o == nil || o.typ != objTree {
-			return
-		}
-		for _, e := range o.tree {
-			path := prefix + e.name
-			if e.isDir() {
-				walk(e.oid, path+"/")
-			} else {
-				out[path] = flatFile{mode: e.mode, oid: e.oid}
-			}
+	files := make(map[string]flatFile)
+	r.collectFiles(files, treeOid, "")
+	return files
+}
+
+func (r *repository) collectFiles(files map[string]flatFile, tree Oid, prefix string) {
+	for _, entry := range r.treeEntries(tree) {
+		path := prefix + entry.name
+		if entry.isDir() {
+			r.collectFiles(files, entry.oid, path+"/")
+		} else {
+			files[path] = flatFile{mode: entry.mode, oid: entry.oid}
 		}
 	}
-	walk(treeOid, "")
-	return out
+}
+
+func (r *repository) treeEntries(oid Oid) []treeEntry {
+	if tree := r.objects[oid]; tree != nil && tree.typ == objTree {
+		return tree.tree
+	}
+	return nil
 }
 
 // treeFromFlat builds the nested trees for a flat path map and answers the
 // root tree id.
 func (r *repository) treeFromFlat(flat map[string]flatFile) Oid {
-	// Group paths by their first segment, recursively.
-	var build func(paths map[string]flatFile, prefix string) Oid
-	build = func(paths map[string]flatFile, prefix string) Oid {
-		dirs := map[string]map[string]flatFile{}
-		var entries []treeEntry
-		for path, f := range paths {
-			rel := strings.TrimPrefix(path, prefix)
-			if i := strings.IndexByte(rel, '/'); i >= 0 {
-				dir := rel[:i]
-				if dirs[dir] == nil {
-					dirs[dir] = map[string]flatFile{}
-				}
-				dirs[dir][path] = f
-			} else {
-				entries = append(entries, treeEntry{mode: f.mode, name: rel, oid: f.oid})
-			}
-		}
-		for dir, sub := range dirs {
-			entries = append(entries, treeEntry{mode: "40000", name: dir, oid: build(sub, prefix+dir+"/")})
-		}
-		return r.buildTreeObject(entries)
+	var root treeBuilder
+	for path, file := range flat {
+		root.add(path, file)
 	}
-	return build(flat, "")
+	return root.store(r)
+}
+
+// Insert each path once and write children before parents. Files and subtrees
+// remain separate here so the same names are accepted as in the flat map.
+type treeBuilder struct {
+	files []treeEntry
+	dirs  map[string]*treeBuilder
+}
+
+func (b *treeBuilder) add(path string, file flatFile) {
+	for {
+		name, rest, nested := strings.Cut(path, "/")
+		if !nested {
+			b.files = append(b.files, treeEntry{name: name, mode: file.mode, oid: file.oid})
+			return
+		}
+		if b.dirs == nil {
+			b.dirs = make(map[string]*treeBuilder)
+		}
+		child := b.dirs[name]
+		if child == nil {
+			child = &treeBuilder{}
+			b.dirs[name] = child
+		}
+		b, path = child, rest
+	}
+}
+
+func (b *treeBuilder) store(r *repository) Oid {
+	entries := slices.Grow(b.files, len(b.dirs))
+	for name, dir := range b.dirs {
+		entries = append(entries, treeEntry{name: name, mode: "40000", oid: dir.store(r)})
+	}
+	return r.buildTreeObject(entries)
 }
 
 // treeAtPath reads the tree object at a directory path within a tree, or the
 // zero id when the path is absent or not a directory.
 func (r *repository) treeAtPath(treeOid Oid, dirPath string) Oid {
-	if dirPath == "" {
-		return treeOid
-	}
-	cur := treeOid
-	for _, seg := range strings.Split(dirPath, "/") {
-		if seg == "" {
+	for segment := range strings.SplitSeq(dirPath, "/") {
+		if segment == "" {
 			continue
 		}
-		o := r.objects[cur]
-		if o == nil || o.typ != objTree {
+		entry := r.findTreeEntry(treeOid, segment, true)
+		if entry == nil || entry.oid.IsZero() {
 			return ZeroOid
 		}
-		found := ZeroOid
-		for _, e := range o.tree {
-			if e.name == seg && e.isDir() {
-				found = e.oid
-				break
-			}
-		}
-		if found.IsZero() {
-			return ZeroOid
-		}
-		cur = found
+		treeOid = entry.oid
 	}
-	return cur
+	return treeOid
 }
 
 // blobAtPath reads the blob id at a file path within a tree.
 func (r *repository) blobAtPath(treeOid Oid, filePath string) (Oid, string, bool) {
-	segments := strings.Split(filePath, "/")
-	cur := treeOid
-	for i, seg := range segments {
-		o := r.objects[cur]
-		if o == nil || o.typ != objTree {
+	for {
+		name, rest, nested := strings.Cut(filePath, "/")
+		entry := r.findTreeEntry(treeOid, name, false)
+		if entry == nil || entry.isDir() != nested {
 			return ZeroOid, "", false
 		}
-		var found *treeEntry
-		for j := range o.tree {
-			if o.tree[j].name == seg {
-				found = &o.tree[j]
-				break
-			}
+		if !nested {
+			return entry.oid, entry.mode, true
 		}
-		if found == nil {
-			return ZeroOid, "", false
-		}
-		if i == len(segments)-1 {
-			if found.isDir() {
-				return ZeroOid, "", false
-			}
-			return found.oid, found.mode, true
-		}
-		if !found.isDir() {
-			return ZeroOid, "", false
-		}
-		cur = found.oid
+		treeOid, filePath = entry.oid, rest
 	}
-	return ZeroOid, "", false
+}
+
+func (r *repository) findTreeEntry(oid Oid, name string, directoriesOnly bool) *treeEntry {
+	entries := r.treeEntries(oid)
+	for i := range entries {
+		entry := &entries[i]
+		if entry.name == name && (!directoriesOnly || entry.isDir()) {
+			return entry
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -183,48 +217,21 @@ func (r *repository) blobAtPath(treeOid Oid, filePath string) (Oid, string, bool
 // isAncestor answers whether ancestor is reachable from descendant (or equal),
 // following first and later parents alike.
 func (r *repository) isAncestor(ancestor, descendant Oid) bool {
-	if ancestor == descendant {
-		return true
-	}
-	seen := map[Oid]bool{}
-	stack := []Oid{descendant}
-	for len(stack) > 0 {
-		cur := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if seen[cur] {
-			continue
-		}
-		seen[cur] = true
-		c := r.commitOf(cur)
-		if c == nil {
-			continue
-		}
-		for _, p := range c.parents {
-			if p == ancestor {
-				return true
-			}
-			stack = append(stack, p)
+	for oid := range r.commitHistory(descendant) {
+		if oid == ancestor {
+			return true
 		}
 	}
 	return false
 }
 
 // ancestorsOf returns the set of commits reachable from tip, including tip.
-func (r *repository) ancestorsOf(tip Oid) map[Oid]bool {
-	seen := map[Oid]bool{}
-	stack := []Oid{tip}
-	for len(stack) > 0 {
-		cur := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if seen[cur] {
-			continue
-		}
-		seen[cur] = true
-		if c := r.commitOf(cur); c != nil {
-			stack = append(stack, c.parents...)
-		}
+func (r *repository) ancestorsOf(tip Oid) fetchObjectSet {
+	ancestors := make(fetchObjectSet)
+	for oid := range r.commitHistory(tip) {
+		ancestors.add(oid)
 	}
-	return seen
+	return ancestors
 }
 
 // mergeBase finds a common ancestor of a and b: the first ancestor of a (in
@@ -235,20 +242,9 @@ func (r *repository) mergeBase(a, b Oid) Oid {
 		return ZeroOid
 	}
 	fromB := r.ancestorsOf(b)
-	seen := map[Oid]bool{}
-	queue := []Oid{a}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		if seen[cur] {
-			continue
-		}
-		seen[cur] = true
-		if fromB[cur] {
-			return cur
-		}
-		if c := r.commitOf(cur); c != nil {
-			queue = append(queue, c.parents...)
+	for oid := range r.commitHistory(a) {
+		if fromB.has(oid) {
+			return oid
 		}
 	}
 	return ZeroOid
@@ -257,22 +253,29 @@ func (r *repository) mergeBase(a, b Oid) Oid {
 // historyOf lists the commits reachable from tip, children before parents,
 // each commit once, in breadth-first order.
 func (r *repository) historyOf(tip Oid) []Oid {
-	var out []Oid
-	seen := map[Oid]bool{}
+	return slices.Collect(r.commitHistory(tip))
+}
+
+func (r *repository) commitHistory(tip Oid) func(func(Oid) bool) {
+	return func(yield func(Oid) bool) { r.walkCommitHistory(tip, yield) }
+}
+
+func (r *repository) walkCommitHistory(tip Oid, yield func(Oid) bool) {
+	seen := fetchObjectSet{tip: {}}
 	queue := []Oid{tip}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		if seen[cur] {
-			continue
+	for next := 0; next < len(queue); next++ {
+		oid := queue[next]
+		if !yield(oid) {
+			return
 		}
-		seen[cur] = true
-		out = append(out, cur)
-		if c := r.commitOf(cur); c != nil {
-			queue = append(queue, c.parents...)
+		if commit := r.commitOf(oid); commit != nil {
+			for _, parent := range commit.parents {
+				if seen.add(parent) {
+					queue = append(queue, parent)
+				}
+			}
 		}
 	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -281,51 +284,51 @@ func (r *repository) historyOf(tip Oid) []Oid {
 // mergeTrees merges theirs into ours against base. It answers the merged flat
 // map, or ok=false when the two sides changed the same path differently.
 func (r *repository) mergeTrees(base, ours, theirs map[string]flatFile) (map[string]flatFile, bool) {
-	merged := map[string]flatFile{}
-	paths := map[string]bool{}
-	for p := range base {
-		paths[p] = true
-	}
-	for p := range ours {
-		paths[p] = true
-	}
-	for p := range theirs {
-		paths[p] = true
-	}
-	for p := range paths {
-		b, inB := base[p]
-		o, inO := ours[p]
-		t, inT := theirs[p]
-		switch {
-		case inO && inT && o == t:
-			merged[p] = o
-		case inB && inO && inT && o == b && t != b:
-			merged[p] = t
-		case inB && inO && inT && t == b && o != b:
-			merged[p] = o
-		case !inB && inO && inT && o == t:
-			merged[p] = o
-		case !inB && inO && !inT:
-			merged[p] = o
-		case !inB && !inO && inT:
-			merged[p] = t
-		case inB && inO && !inT && o == b:
-			// Deleted by theirs, unchanged by ours: deleted.
-		case inB && !inO && inT && t == b:
-			// Deleted by ours, unchanged by theirs: deleted.
-		case inB && inO && !inT:
-			return nil, false // deleted by theirs, modified by ours
-		case inB && !inO && inT:
-			return nil, false // deleted by ours, modified by theirs
-		case inB && inO && inT:
-			return nil, false // both modified differently
-		case !inB && inO && inT:
-			return nil, false // both added differently
-		case inB && !inO && !inT:
-			// Deleted by both.
+	merged := make(map[string]flatFile, len(ours))
+	for path := range filePaths(ours, theirs) {
+		oursAtPath := fileVersionAt(ours, path)
+		theirsAtPath := fileVersionAt(theirs, path)
+		chosen, ok := mergeFileVersions(fileVersionAt(base, path), oursAtPath, theirsAtPath)
+		if !ok {
+			return nil, false
+		}
+		if chosen.present {
+			merged[path] = chosen.file
 		}
 	}
 	return merged, true
+}
+
+type fileVersion struct {
+	file    flatFile
+	present bool
+}
+
+func fileVersionAt(files map[string]flatFile, path string) fileVersion {
+	file, exists := files[path]
+	return fileVersion{file: file, present: exists}
+}
+
+func mergeFileVersions(base, ours, theirs fileVersion) (fileVersion, bool) {
+	switch {
+	case ours == theirs, theirs == base:
+		return ours, true
+	case ours == base:
+		return theirs, true
+	default:
+		return fileVersion{}, false
+	}
+}
+
+func filePaths(a, b map[string]flatFile) map[string]struct{} {
+	paths := make(map[string]struct{}, max(len(a), len(b)))
+	for name := range maps.Keys(a) {
+		paths[name] = struct{}{}
+	}
+	for name := range maps.Keys(b) {
+		paths[name] = struct{}{}
+	}
+	return paths
 }
 
 // mergeable answers whether merging headTip into baseTip would be clean.
@@ -333,19 +336,20 @@ func (r *repository) mergeable(baseTip, headTip Oid) bool {
 	if baseTip.IsZero() || headTip.IsZero() {
 		return true
 	}
-	base := r.mergeBase(baseTip, headTip)
-	var baseTree, oursTree, theirsTree Oid
-	if c := r.commitOf(base); c != nil {
-		baseTree = c.tree
-	}
-	if c := r.commitOf(baseTip); c != nil {
-		oursTree = c.tree
-	}
-	if c := r.commitOf(headTip); c != nil {
-		theirsTree = c.tree
-	}
-	_, ok := r.mergeTrees(r.flattenTree(baseTree), r.flattenTree(oursTree), r.flattenTree(theirsTree))
+	_, ok := r.mergeCommits(baseTip, headTip)
 	return ok
+}
+
+func (r *repository) mergeCommits(ours, theirs Oid) (map[string]flatFile, bool) {
+	base := r.mergeBase(ours, theirs)
+	return r.mergeTrees(r.flattenTree(r.commitTree(base)), r.flattenTree(r.commitTree(ours)), r.flattenTree(r.commitTree(theirs)))
+}
+
+func (r *repository) commitTree(oid Oid) Oid {
+	if commit := r.commitOf(oid); commit != nil {
+		return commit.tree
+	}
+	return ZeroOid
 }
 
 // fileChange is one path's change between two trees.
@@ -363,58 +367,40 @@ type fileChange struct {
 func (r *repository) diffTrees(oldTree, newTree Oid) []fileChange {
 	oldFlat := r.flattenTree(oldTree)
 	newFlat := r.flattenTree(newTree)
-	paths := map[string]bool{}
-	for p := range oldFlat {
-		paths[p] = true
-	}
-	for p := range newFlat {
-		paths[p] = true
-	}
-	var names []string
-	for p := range paths {
-		names = append(names, p)
-	}
-	sort.Strings(names)
-	var out []fileChange
-	for _, p := range names {
-		o, inO := oldFlat[p]
-		n, inN := newFlat[p]
+	var changes []fileChange
+	for _, path := range sortedKeys(filePaths(oldFlat, newFlat)) {
+		old, current := fileVersionAt(oldFlat, path), fileVersionAt(newFlat, path)
+		change := fileChange{path: path, blobOid: current.file.oid}
 		switch {
-		case inO && inN && o.oid == n.oid:
-			// Unchanged.
-		case !inO && inN:
-			out = append(out, fileChange{path: p, status: "added", additions: r.lineCount(n.oid), blobOid: n.oid})
-		case inO && !inN:
-			out = append(out, fileChange{path: p, status: "removed", deletions: r.lineCount(o.oid)})
+		case !old.present:
+			change.status = "added"
+			change.additions = countLines(r.objectData(change.blobOid))
+		case !current.present:
+			change.status = "removed"
+			change.deletions = countLines(r.objectData(old.file.oid))
+		case old.file.oid == current.file.oid:
+			continue
 		default:
-			add, del := r.lineDiff(o.oid, n.oid)
-			out = append(out, fileChange{path: p, status: "modified", additions: add, deletions: del, blobOid: n.oid})
+			change.status = "modified"
+			change.additions, change.deletions = lineDiff(r.objectData(old.file.oid), r.objectData(change.blobOid))
 		}
+		changes = append(changes, change)
 	}
-	return out
+	return changes
 }
 
 // lineCount counts the lines of a blob: newlines plus one for a trailing
 // partial line.
-func (r *repository) lineCount(oid Oid) int {
-	o := r.objects[oid]
-	if o == nil {
-		return 0
+func (r *repository) objectData(oid Oid) []byte {
+	if object := r.objects[oid]; object != nil {
+		return object.data
 	}
-	return countLines(o.data)
+	return nil
 }
 
 func countLines(data []byte) int {
-	if len(data) == 0 {
-		return 0
-	}
-	n := 0
-	for _, b := range data {
-		if b == '\n' {
-			n++
-		}
-	}
-	if data[len(data)-1] != '\n' {
+	n := bytes.Count(data, []byte{'\n'})
+	if len(data) > 0 && data[len(data)-1] != '\n' {
 		n++
 	}
 	return n
@@ -422,33 +408,31 @@ func countLines(data []byte) int {
 
 // lineDiff estimates added and removed lines between two blobs by stripping
 // the common prefix and suffix lines.
-func (r *repository) lineDiff(oldOid, newOid Oid) (add, del int) {
-	var oldLines, newLines []string
-	if o := r.objects[oldOid]; o != nil {
-		oldLines = splitLines(o.data)
+func lineDiff(before, after []byte) (add, del int) {
+	for len(before) != 0 && len(after) != 0 {
+		old, oldTail, _ := bytes.Cut(before, []byte{'\n'})
+		current, currentTail, _ := bytes.Cut(after, []byte{'\n'})
+		if !bytes.Equal(old, current) {
+			break
+		}
+		before, after = oldTail, currentTail
 	}
-	if o := r.objects[newOid]; o != nil {
-		newLines = splitLines(o.data)
+	for len(before) != 0 && len(after) != 0 {
+		old, oldHead := lastLine(before)
+		current, currentHead := lastLine(after)
+		if !bytes.Equal(old, current) {
+			break
+		}
+		before, after = oldHead, currentHead
 	}
-	pre := 0
-	for pre < len(oldLines) && pre < len(newLines) && oldLines[pre] == newLines[pre] {
-		pre++
-	}
-	suf := 0
-	for suf < len(oldLines)-pre && suf < len(newLines)-pre && oldLines[len(oldLines)-1-suf] == newLines[len(newLines)-1-suf] {
-		suf++
-	}
-	return len(newLines) - pre - suf, len(oldLines) - pre - suf
+	return countLines(after), countLines(before)
 }
 
-func splitLines(data []byte) []string {
-	if len(data) == 0 {
-		return nil
+func lastLine(data []byte) (line, rest []byte) {
+	end := len(data)
+	if end > 0 && data[end-1] == '\n' {
+		end--
 	}
-	text := string(data)
-	lines := strings.Split(text, "\n")
-	if lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-	return lines
+	start := bytes.LastIndexByte(data[:end], '\n') + 1
+	return data[start:end], data[:start]
 }

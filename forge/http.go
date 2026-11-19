@@ -8,20 +8,21 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // request is one parsed HTTP request.
 type request struct {
 	method  string
-	target  string // raw request target
 	path    string // decoded path, no query, no trailing slash (except root)
 	query   string
-	headers map[string]string // lowercased names, first value wins
+	headers requestHeaders
 	body    []byte
 	host    string
 
@@ -29,25 +30,80 @@ type request struct {
 	segsDone bool
 }
 
-func (q *request) header(name string) string {
-	// Header names are stored lowercased; skip the lowercasing allocation
-	// when the caller already passed a lowercase name.
-	lower := true
-	for i := 0; i < len(name); i++ {
-		if name[i] >= 'A' && name[i] <= 'Z' {
-			lower = false
-			break
+type headerSlot uint8
+
+const (
+	hostHeader headerSlot = iota
+	authHeader
+	protocolHeader
+	expectHeader
+	transferHeader
+	lengthHeader
+	connectionHeader
+	headerSlots
+)
+
+type requestHeaders struct {
+	seen   uint16
+	values [headerSlots]string
+}
+
+func (h *requestHeaders) read(line []byte) error {
+	name, value, found := bytes.Cut(line, []byte{':'})
+	if !found {
+		return fmt.Errorf("bad header %q", line)
+	}
+	slot := matchHeader(bytes.TrimSpace(name))
+	if slot == headerSlots {
+		return nil
+	}
+	mask := uint16(1) << slot
+	if h.seen&mask == 0 {
+		// The line may alias the reader buffer. Retain only values used by
+		// the server, and preserve first-value semantics even for blank ones.
+		h.values[slot] = string(bytes.TrimSpace(value))
+		h.seen |= mask
+	}
+	return nil
+}
+
+func matchHeader(name []byte) headerSlot {
+	switch len(name) {
+	case 4:
+		if bytes.EqualFold(name, []byte("host")) {
+			return hostHeader
+		}
+	case 6:
+		if bytes.EqualFold(name, []byte("expect")) {
+			return expectHeader
+		}
+	case 10:
+		if bytes.EqualFold(name, []byte("connection")) {
+			return connectionHeader
+		}
+	case 12:
+		if bytes.EqualFold(name, []byte("git-protocol")) {
+			return protocolHeader
+		}
+	case 13:
+		if bytes.EqualFold(name, []byte("authorization")) {
+			return authHeader
+		}
+	case 14:
+		if bytes.EqualFold(name, []byte("content-length")) {
+			return lengthHeader
+		}
+	case 17:
+		if bytes.EqualFold(name, []byte("transfer-encoding")) {
+			return transferHeader
 		}
 	}
-	if lower {
-		return q.headers[name]
-	}
-	return q.headers[strings.ToLower(name)]
+	return headerSlots
 }
 
 // queryValue answers the first value of a query parameter.
 func (q *request) queryValue(name string) string {
-	for _, pair := range strings.Split(q.query, "&") {
+	for pair := range strings.SplitSeq(q.query, "&") {
 		if pair == "" {
 			continue
 		}
@@ -94,7 +150,9 @@ func (q *request) segments() []string {
 type response struct {
 	status      int
 	contentType string
-	headers     map[string]string
+	requestID   uint64
+	oauthScopes bool
+	nextLink    string
 	body        []byte
 }
 
@@ -118,7 +176,7 @@ func newServer(st *store, token string) *server {
 
 // authorized answers whether the request carries the expected bearer token.
 func (s *server) authorized(q *request) bool {
-	auth := q.header("authorization")
+	auth := q.headers.values[authHeader]
 	if !strings.HasPrefix(auth, "Bearer ") {
 		return false
 	}
@@ -149,10 +207,26 @@ func (s *server) serve(ln net.Listener) {
 	}
 }
 
+type connBuffers struct {
+	reader *bufio.Reader
+	writer *bufio.Writer
+}
+
+var connBufferPool = sync.Pool{New: func() any {
+	return &connBuffers{bufio.NewReaderSize(nil, 8192), bufio.NewWriterSize(nil, 16384)}
+}}
+
 func (s *server) serveConn(conn net.Conn) {
 	defer conn.Close()
-	br := bufio.NewReaderSize(conn, 65536)
-	bw := bufio.NewWriterSize(conn, 65536)
+	buffers := connBufferPool.Get().(*connBuffers)
+	br, bw := buffers.reader, buffers.writer
+	br.Reset(conn)
+	bw.Reset(conn)
+	defer func() {
+		br.Reset(nil)
+		bw.Reset(nil)
+		connBufferPool.Put(buffers)
+	}()
 	for {
 		req, keepAlive, err := readRequest(br, bw)
 		if err != nil {
@@ -176,115 +250,129 @@ const maxBodyBytes = 64 * 1024 * 1024
 // request, whether the connection stays open, and an error when the peer went
 // away or the request is unusable.
 func readRequest(br *bufio.Reader, bw *bufio.Writer) (*request, bool, error) {
-	// Request line.
 	line, err := readLineCapped(br, maxHeaderBytes)
 	if err != nil {
 		return nil, false, err
 	}
-	if line == "" {
+	if len(line) == 0 {
 		// A stray blank line before the request: tolerate one, then retry.
 		line, err = readLineCapped(br, maxHeaderBytes)
 		if err != nil {
 			return nil, false, err
 		}
 	}
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
-		return nil, false, fmt.Errorf("bad request line %q", line)
+	method, target, version, err := parseStartLine(string(line))
+	if err != nil {
+		return nil, false, err
 	}
-	method, target, version := parts[0], parts[1], parts[2]
-	req := &request{method: method, target: target, headers: map[string]string{}}
-	// Headers.
-	headerBytes := 0
-	for {
-		h, err := readLineCapped(br, maxHeaderBytes)
-		if err != nil {
+	req := &request{method: method}
+	req.path, req.query = splitTarget(target)
+	if err := readHeaders(br, &req.headers); err != nil {
+		return nil, false, err
+	}
+	req.host = req.headers.values[hostHeader]
+	if strings.EqualFold(req.headers.values[expectHeader], "100-continue") {
+		if _, err := bw.WriteString("HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
 			return nil, false, err
 		}
-		headerBytes += len(h) + 2
-		if headerBytes > maxHeaderBytes {
-			return nil, false, fmt.Errorf("headers too large")
-		}
-		if h == "" {
-			break
-		}
-		name, value, ok := strings.Cut(h, ":")
-		if !ok {
-			return nil, false, fmt.Errorf("bad header %q", h)
-		}
-		name = strings.ToLower(strings.TrimSpace(name))
-		value = strings.TrimSpace(value)
-		if _, seen := req.headers[name]; !seen {
-			req.headers[name] = value
+		if err := bw.Flush(); err != nil {
+			return nil, false, err
 		}
 	}
-	// Path and query.
-	path := target
-	if i := strings.IndexByte(target, '?'); i >= 0 {
-		path = target[:i]
-		req.query = target[i+1:]
+	if req.body, err = readRequestBody(br, &req.headers); err != nil {
+		return nil, false, err
 	}
-	// Absolute-form targets (http://host/path) are reduced to their path.
-	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
-		if i := strings.Index(path[8:], "/"); i >= 0 {
-			path = path[8+i:]
+	connection := strings.ToLower(req.headers.values[connectionHeader])
+	keepAlive := !strings.Contains(connection, "close") &&
+		(version != "HTTP/1.0" || strings.Contains(connection, "keep-alive"))
+	return req, keepAlive, nil
+}
+
+func parseStartLine(line string) (method, target, version string, err error) {
+	method, tail, space := strings.Cut(line, " ")
+	target, version, protocol := strings.Cut(tail, " ")
+	if !space || !protocol {
+		return "", "", "", fmt.Errorf("bad request line %q", line)
+	}
+	return method, target, version, nil
+}
+
+func splitTarget(target string) (path, query string) {
+	path, query, _ = strings.Cut(target, "?")
+	if scheme, authority, absolute := strings.Cut(path, "://"); absolute && (scheme == "http" || scheme == "https") {
+		if slash := strings.IndexByte(authority, '/'); slash >= 0 {
+			path = authority[slash:]
 		} else {
 			path = "/"
 		}
 	}
-	req.path = path
-	if len(req.path) > 1 {
-		req.path = strings.TrimRight(req.path, "/")
+	if len(path) > 1 {
+		path = strings.TrimRight(path, "/")
 	}
-	req.host = req.header("host")
-
-	// 100-continue: answer before reading the body.
-	if strings.EqualFold(req.header("expect"), "100-continue") {
-		bw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
-		bw.Flush()
-	}
-
-	// Body.
-	if strings.Contains(strings.ToLower(req.header("transfer-encoding")), "chunked") {
-		body, err := readChunked(br)
-		if err != nil {
-			return nil, false, err
-		}
-		req.body = body
-	} else if cl := req.header("content-length"); cl != "" {
-		n, err := strconv.Atoi(strings.TrimSpace(cl))
-		if err != nil || n < 0 || n > maxBodyBytes {
-			return nil, false, fmt.Errorf("bad content-length %q", cl)
-		}
-		if n > 0 {
-			body := make([]byte, n)
-			if _, err := io.ReadFull(br, body); err != nil {
-				return nil, false, err
-			}
-			req.body = body
-		}
-	}
-
-	keepAlive := true
-	conn := strings.ToLower(req.header("connection"))
-	if strings.Contains(conn, "close") {
-		keepAlive = false
-	} else if version == "HTTP/1.0" && !strings.Contains(conn, "keep-alive") {
-		keepAlive = false
-	}
-	return req, keepAlive, nil
+	return path, query
 }
 
-func readLineCapped(br *bufio.Reader, cap int) (string, error) {
-	line, err := br.ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
+func readHeaders(br *bufio.Reader, headers *requestHeaders) error {
+	remaining := maxHeaderBytes
+	for {
+		line, err := readLineCapped(br, maxHeaderBytes)
+		if err != nil {
+			return err
+		}
+		remaining -= len(line) + 2
+		if remaining < 0 {
+			return fmt.Errorf("headers too large")
+		}
+		if len(line) == 0 {
+			return nil
+		}
+		if err := headers.read(line); err != nil {
+			return err
+		}
 	}
-	if len(line) > cap {
-		return "", fmt.Errorf("line too long")
+}
+
+func readRequestBody(br *bufio.Reader, headers *requestHeaders) ([]byte, error) {
+	if strings.Contains(strings.ToLower(headers.values[transferHeader]), "chunked") {
+		return readChunked(br)
 	}
-	line = strings.TrimRight(line, "\r\n")
-	return line, nil
+	length := headers.values[lengthHeader]
+	if length == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(length)
+	if err != nil || n < 0 || n > maxBodyBytes {
+		return nil, fmt.Errorf("bad content-length %q", length)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	body := make([]byte, n)
+	_, err = io.ReadFull(br, body)
+	return body, err
+}
+
+// The common path aliases the reader buffer until the next read. Only lines
+// spanning buffers require accumulation, bounded by limit at each step.
+func readLineCapped(br *bufio.Reader, limit int) ([]byte, error) {
+	var prefix []byte
+	for {
+		part, err := br.ReadSlice('\n')
+		if len(prefix)+len(part) > limit {
+			return nil, fmt.Errorf("line too long")
+		}
+		if err == bufio.ErrBufferFull {
+			prefix = append(prefix, part...)
+			continue
+		}
+		if len(prefix) != 0 {
+			part = append(prefix, part...)
+		}
+		if len(part) == 0 && err != nil {
+			return nil, err
+		}
+		return bytes.TrimRight(part, "\r\n"), nil
+	}
 }
 
 func readChunked(br *bufio.Reader) ([]byte, error) {
@@ -294,8 +382,8 @@ func readChunked(br *bufio.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		sizeText, _, _ := strings.Cut(line, ";")
-		n, err := strconv.ParseInt(strings.TrimSpace(sizeText), 16, 64)
+		sizeText, _, _ := bytes.Cut(line, []byte{';'})
+		n, err := strconv.ParseInt(string(bytes.TrimSpace(sizeText)), 16, 64)
 		if err != nil || n < 0 || n > maxBodyBytes {
 			return nil, fmt.Errorf("bad chunk size %q", line)
 		}
@@ -306,19 +394,19 @@ func readChunked(br *bufio.Reader) ([]byte, error) {
 				if err != nil {
 					return nil, err
 				}
-				if t == "" {
+				if len(t) == 0 {
 					break
 				}
 			}
 			return out, nil
 		}
-		chunk := make([]byte, n)
-		if _, err := io.ReadFull(br, chunk); err != nil {
-			return nil, err
-		}
-		out = append(out, chunk...)
-		if len(out) > maxBodyBytes {
+		if n > int64(maxBodyBytes-len(out)) {
 			return nil, fmt.Errorf("chunked body too large")
+		}
+		start := len(out)
+		out = append(out, make([]byte, int(n))...)
+		if _, err := io.ReadFull(br, out[start:]); err != nil {
+			return nil, err
 		}
 		// The CRLF after the chunk.
 		if _, err := readLineCapped(br, 16); err != nil {
@@ -346,7 +434,8 @@ func writeResponse(bw *bufio.Writer, resp response, keepAlive bool) {
 	if reason == "" {
 		reason = "Status"
 	}
-	h := make([]byte, 0, 256)
+	var local [256]byte
+	h := local[:0]
 	h = append(h, "HTTP/1.1 "...)
 	h = strconv.AppendInt(h, int64(resp.status), 10)
 	h = append(h, ' ')
@@ -367,11 +456,18 @@ func writeResponse(bw *bufio.Writer, resp response, keepAlive bool) {
 	} else {
 		h = append(h, "Connection: close\r\n"...)
 	}
-	for k, v := range resp.headers {
-		h = append(h, k...)
-		h = append(h, ": "...)
-		h = append(h, v...)
+	if resp.nextLink != "" {
+		h = append(h, "Link: "...)
+		h = append(h, resp.nextLink...)
 		h = append(h, "\r\n"...)
+	}
+	if resp.requestID != 0 {
+		h = append(h, "X-GitHub-Request-Id: req-"...)
+		h = strconv.AppendUint(h, resp.requestID, 10)
+		h = append(h, "\r\n"...)
+	}
+	if resp.oauthScopes {
+		h = append(h, "X-OAuth-Scopes: repo, read:org, user\r\n"...)
 	}
 	h = append(h, "\r\n"...)
 	bw.Write(h)

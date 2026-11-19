@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -45,183 +46,157 @@ type gqlToken struct {
 }
 
 type gqlLexer struct {
-	src string
-	pos int
+	rest string
 }
 
 func (l *gqlLexer) next() (gqlToken, error) {
-	for l.pos < len(l.src) {
-		c := l.src[l.pos]
-		switch {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',':
-			l.pos++
-		case c == '#':
-			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
-				l.pos++
-			}
-		case c == '{':
-			l.pos++
-			return gqlToken{kind: tokLBrace, text: "{"}, nil
-		case c == '}':
-			l.pos++
-			return gqlToken{kind: tokRBrace, text: "}"}, nil
-		case c == '(':
-			l.pos++
-			return gqlToken{kind: tokLParen, text: "("}, nil
-		case c == ')':
-			l.pos++
-			return gqlToken{kind: tokRParen, text: ")"}, nil
-		case c == '[':
-			l.pos++
-			return gqlToken{kind: tokLBracket, text: "["}, nil
-		case c == ']':
-			l.pos++
-			return gqlToken{kind: tokRBracket, text: "]"}, nil
-		case c == ':':
-			l.pos++
-			return gqlToken{kind: tokColon, text: ":"}, nil
-		case c == '$':
-			l.pos++
-			return gqlToken{kind: tokDollar, text: "$"}, nil
-		case c == '!':
-			l.pos++
-			return gqlToken{kind: tokBang, text: "!"}, nil
-		case c == '=':
-			l.pos++
-			return gqlToken{kind: tokEquals, text: "="}, nil
-		case c == '@':
-			l.pos++
-			return gqlToken{kind: tokAt, text: "@"}, nil
-		case c == '.' && l.pos+2 < len(l.src) && l.src[l.pos+1] == '.' && l.src[l.pos+2] == '.':
-			l.pos += 3
-			return gqlToken{kind: tokSpread, text: "..."}, nil
-		case c == '"':
-			return l.readString()
-		case c == '-' || (c >= '0' && c <= '9'):
-			return l.readNumber()
-		case c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'):
-			start := l.pos
-			for l.pos < len(l.src) {
-				d := l.src[l.pos]
-				if d == '_' || (d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9') {
-					l.pos++
-				} else {
-					break
-				}
-			}
-			return gqlToken{kind: tokName, text: l.src[start:l.pos]}, nil
-		default:
-			return gqlToken{}, fmt.Errorf("unexpected character %q in document", c)
-		}
+	l.skipTrivia()
+	if l.rest == "" {
+		return gqlToken{kind: tokEOF}, nil
 	}
-	return gqlToken{kind: tokEOF}, nil
+	first := l.rest[0]
+	if kind := gqlPunctuation[first]; kind != tokEOF {
+		return l.emit(kind, 1), nil
+	}
+	switch {
+	case strings.HasPrefix(l.rest, "..."):
+		return l.emit(tokSpread, 3), nil
+	case first == '"':
+		return l.scanString()
+	case first == '-' || gqlDigit(first):
+		return l.scanNumber(), nil
+	case gqlNameStart(first):
+		end := 1
+		for end < len(l.rest) && (gqlNameStart(l.rest[end]) || gqlDigit(l.rest[end])) {
+			end++
+		}
+		return l.emit(tokName, end), nil
+	default:
+		return gqlToken{}, fmt.Errorf("unexpected character %q in document", first)
+	}
 }
 
-func (l *gqlLexer) readString() (gqlToken, error) {
-	l.pos++ // opening quote
-	var b strings.Builder
-	for l.pos < len(l.src) {
-		c := l.src[l.pos]
-		if c == '"' {
-			l.pos++
-			return gqlToken{kind: tokString, text: b.String()}, nil
+var gqlPunctuation = [256]gqlTokenKind{
+	'{': tokLBrace, '}': tokRBrace,
+	'(': tokLParen, ')': tokRParen,
+	'[': tokLBracket, ']': tokRBracket,
+	':': tokColon, '$': tokDollar, '!': tokBang, '=': tokEquals, '@': tokAt,
+}
+
+func gqlNameStart(c byte) bool { return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+func gqlDigit(c byte) bool     { return c >= '0' && c <= '9' }
+
+func (l *gqlLexer) emit(kind gqlTokenKind, size int) gqlToken {
+	token := gqlToken{kind: kind, text: l.rest[:size]}
+	l.rest = l.rest[size:]
+	return token
+}
+
+func (l *gqlLexer) skipTrivia() {
+	for {
+		l.rest = strings.TrimLeft(l.rest, " \t\r\n,")
+		if !strings.HasPrefix(l.rest, "#") {
+			return
 		}
-		if c == '\n' {
-			return gqlToken{}, fmt.Errorf("unterminated string")
+		_, l.rest, _ = strings.Cut(l.rest, "\n")
+	}
+}
+
+func (l *gqlLexer) scanString() (gqlToken, error) {
+	input := l.rest[1:]
+	var decoded strings.Builder
+	for start := 0; start < len(input); {
+		width := strings.IndexAny(input[start:], "\"\\\n")
+		if width < 0 {
+			break
 		}
-		if c == '\\' && l.pos+1 < len(l.src) {
-			l.pos++
-			esc := l.src[l.pos]
-			switch esc {
-			case '"':
-				b.WriteByte('"')
-			case '\\':
-				b.WriteByte('\\')
-			case '/':
-				b.WriteByte('/')
-			case 'b':
-				b.WriteByte('\b')
-			case 'f':
-				b.WriteByte('\f')
-			case 'n':
-				b.WriteByte('\n')
-			case 'r':
-				b.WriteByte('\r')
-			case 't':
-				b.WriteByte('\t')
-			case 'u':
-				if l.pos+4 < len(l.src) {
-					if n, err := strconv.ParseUint(l.src[l.pos+1:l.pos+5], 16, 32); err == nil {
-						b.WriteRune(rune(n))
-						l.pos += 4
-					}
-				}
-			default:
-				b.WriteByte(esc)
+		end := start + width
+		switch input[end] {
+		case '"':
+			l.rest = input[end+1:]
+			if start == 0 {
+				return gqlToken{kind: tokString, text: input[:end]}, nil
 			}
-			l.pos++
-			continue
+			decoded.WriteString(input[start:end])
+			return gqlToken{kind: tokString, text: decoded.String()}, nil
+		case '\n':
+			return gqlToken{}, fmt.Errorf("unterminated string")
+		case '\\':
+			decoded.WriteString(input[start:end])
+			start = end + 1 + appendGQLEscape(&decoded, input[end+1:])
 		}
-		b.WriteByte(c)
-		l.pos++
 	}
 	return gqlToken{}, fmt.Errorf("unterminated string")
 }
 
-func (l *gqlLexer) readNumber() (gqlToken, error) {
-	start := l.pos
-	if l.src[l.pos] == '-' {
-		l.pos++
+// The forge has historically accepted unknown escapes and ignored a malformed
+// Unicode escape marker. Keep that decoding behavior for existing queries.
+func appendGQLEscape(text *strings.Builder, escape string) int {
+	if escape == "" {
+		return 0
 	}
-	isFloat := false
-	for l.pos < len(l.src) && l.src[l.pos] >= '0' && l.src[l.pos] <= '9' {
-		l.pos++
-	}
-	if l.pos < len(l.src) && l.src[l.pos] == '.' {
-		isFloat = true
-		l.pos++
-		for l.pos < len(l.src) && l.src[l.pos] >= '0' && l.src[l.pos] <= '9' {
-			l.pos++
+	if escape[0] == 'u' {
+		if len(escape) >= 5 {
+			if code, err := strconv.ParseUint(escape[1:5], 16, 32); err == nil {
+				text.WriteRune(rune(code))
+				return 5
+			}
 		}
+		return 1
 	}
-	if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
-		isFloat = true
-		l.pos++
-		if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
-			l.pos++
-		}
-		for l.pos < len(l.src) && l.src[l.pos] >= '0' && l.src[l.pos] <= '9' {
-			l.pos++
-		}
+	const spellings = "bfnrt"
+	const replacements = "\b\f\n\r\t"
+	if i := strings.IndexByte(spellings, escape[0]); i >= 0 {
+		text.WriteByte(replacements[i])
+	} else {
+		text.WriteByte(escape[0])
 	}
+	return 1
+}
+
+func (l *gqlLexer) scanNumber() gqlToken {
+	input := l.rest
+	end := 0
+	if input[0] == '-' {
+		end++
+	}
+	end = gqlDigitEnd(input, end)
 	kind := tokInt
-	if isFloat {
+	if end < len(input) && input[end] == '.' {
 		kind = tokFloat
+		end = gqlDigitEnd(input, end+1)
 	}
-	return gqlToken{kind: kind, text: l.src[start:l.pos]}, nil
+	if end < len(input) && (input[end] == 'e' || input[end] == 'E') {
+		kind = tokFloat
+		end++
+		if end < len(input) && (input[end] == '+' || input[end] == '-') {
+			end++
+		}
+		end = gqlDigitEnd(input, end)
+	}
+	return l.emit(kind, end)
+}
+
+func gqlDigitEnd(text string, start int) int {
+	for start < len(text) && gqlDigit(text[start]) {
+		start++
+	}
+	return start
 }
 
 // ---------------------------------------------------------------------------
 // Parser
 
 type gqlValue struct {
-	kind    string // var, int, float, string, bool, null, enum, list, object
-	name    string // variable name or enum value
-	str     string
-	num     string
-	boolean bool
-	list    []*gqlValue
-	object  []gqlObjectField
-}
-
-type gqlObjectField struct {
-	name  string
-	value *gqlValue
+	variable string
+	literal  any
+	list     []gqlValue
+	object   []gqlArg
 }
 
 type gqlArg struct {
 	name  string
-	value *gqlValue
+	value gqlValue
 }
 
 type gqlField struct {
@@ -246,14 +221,9 @@ type gqlSelectionSet struct {
 	sels []gqlSelection
 }
 
-type gqlVarDef struct {
-	name string
-}
-
 type gqlOperation struct {
 	opType string
 	name   string
-	vars   []gqlVarDef
 	sel    *gqlSelectionSet
 }
 
@@ -274,34 +244,26 @@ type gqlParser struct {
 }
 
 func parseGraphQLDocument(src string) (*gqlDocument, error) {
-	lx := &gqlLexer{src: src}
-	var tokens []gqlToken
-	for {
-		t, err := lx.next()
-		if err != nil {
-			return nil, err
-		}
-		tokens = append(tokens, t)
-		if t.kind == tokEOF {
-			break
-		}
+	tokens, err := tokenizeGraphQL(src)
+	if err != nil {
+		return nil, err
 	}
-	p := &gqlParser{tokens: tokens}
-	doc := &gqlDocument{fragments: map[string]*gqlFragmentDef{}}
+	p := gqlParser{tokens: tokens}
+	doc := &gqlDocument{fragments: make(map[string]*gqlFragmentDef)}
 	for p.peek().kind != tokEOF {
-		if p.peek().kind == tokName && p.peek().text == "fragment" {
-			f, err := p.parseFragment()
+		if p.matchName("fragment") {
+			definition, err := p.parseFragment()
 			if err != nil {
 				return nil, err
 			}
-			doc.fragments[f.name] = f
-			continue
+			doc.fragments[definition.name] = definition
+		} else {
+			operation, err := p.parseOperation()
+			if err != nil {
+				return nil, err
+			}
+			doc.operations = append(doc.operations, operation)
 		}
-		op, err := p.parseOperation()
-		if err != nil {
-			return nil, err
-		}
-		doc.operations = append(doc.operations, op)
 	}
 	if len(doc.operations) == 0 {
 		return nil, fmt.Errorf("the document holds no operation")
@@ -309,8 +271,48 @@ func parseGraphQLDocument(src string) (*gqlDocument, error) {
 	return doc, nil
 }
 
+// Tokenize up front so a lexical error still takes precedence over a syntax
+// error earlier in the document.
+func tokenizeGraphQL(src string) ([]gqlToken, error) {
+	lexer := gqlLexer{rest: src}
+	tokens := make([]gqlToken, 0, min(64, len(src)/3+1))
+	for {
+		t, err := lexer.next()
+		if err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+		if t.kind == tokEOF {
+			return tokens, nil
+		}
+	}
+}
+
 func (p *gqlParser) peek() gqlToken { return p.tokens[p.pos] }
-func (p *gqlParser) take() gqlToken { t := p.tokens[p.pos]; p.pos++; return t }
+
+func (p *gqlParser) take() gqlToken {
+	t := p.peek()
+	if t.kind != tokEOF {
+		p.pos++
+	}
+	return t
+}
+
+func (p *gqlParser) match(kind gqlTokenKind) bool {
+	if p.peek().kind != kind {
+		return false
+	}
+	p.take()
+	return true
+}
+
+func (p *gqlParser) matchName(name string) bool {
+	if t := p.peek(); t.kind == tokName && t.text == name {
+		p.take()
+		return true
+	}
+	return false
+}
 
 func (p *gqlParser) expect(kind gqlTokenKind) (gqlToken, error) {
 	t := p.take()
@@ -321,50 +323,46 @@ func (p *gqlParser) expect(kind gqlTokenKind) (gqlToken, error) {
 }
 
 func (p *gqlParser) parseOperation() (*gqlOperation, error) {
-	op := &gqlOperation{opType: "query"}
-	if t := p.peek(); t.kind == tokName && (t.text == "query" || t.text == "mutation" || t.text == "subscription") {
-		op.opType = p.take().text
-		if p.peek().kind == tokName {
-			op.name = p.take().text
+	operation := gqlOperation{opType: "query"}
+	if first := p.peek(); first.kind == tokName {
+		switch first.text {
+		case "query", "mutation", "subscription":
+			operation.opType = p.take().text
+			if next := p.peek(); next.kind == tokName {
+				operation.name = p.take().text
+			}
 		}
 	}
-	if p.peek().kind == tokLParen {
-		if err := p.parseVarDefs(op); err != nil {
+	if p.match(tokLParen) {
+		if err := p.skipVariables(); err != nil {
 			return nil, err
 		}
 	}
-	if err := p.skipDirectives(); err != nil {
-		return nil, err
-	}
-	sel, err := p.parseSelectionSet()
+	sel, err := p.directedSelectionSet(false)
 	if err != nil {
 		return nil, err
 	}
-	op.sel = sel
-	return op, nil
+	operation.sel = sel
+	return &operation, nil
 }
 
-func (p *gqlParser) parseVarDefs(op *gqlOperation) error {
-	if _, err := p.expect(tokLParen); err != nil {
-		return err
-	}
-	for p.peek().kind != tokRParen {
+// Definitions are validated syntactically, but this schema takes variable
+// values only from the operation envelope.
+func (p *gqlParser) skipVariables() error {
+	for !p.match(tokRParen) {
 		if _, err := p.expect(tokDollar); err != nil {
 			return err
 		}
-		name, err := p.expect(tokName)
-		if err != nil {
+		if _, err := p.expect(tokName); err != nil {
 			return err
 		}
-		op.vars = append(op.vars, gqlVarDef{name: name.text})
 		if _, err := p.expect(tokColon); err != nil {
 			return err
 		}
 		if err := p.parseType(); err != nil {
 			return err
 		}
-		if p.peek().kind == tokEquals {
-			p.take()
+		if p.match(tokEquals) {
 			if _, err := p.parseValue(); err != nil {
 				return err
 			}
@@ -373,39 +371,35 @@ func (p *gqlParser) parseVarDefs(op *gqlOperation) error {
 			return err
 		}
 	}
-	_, err := p.expect(tokRParen)
-	return err
+	return nil
 }
 
 func (p *gqlParser) parseType() error {
-	switch p.peek().kind {
-	case tokLBracket:
-		p.take()
-		if err := p.parseType(); err != nil {
-			return err
-		}
+	// A type consists of one name wrapped by zero or more list modifiers.
+	depth := 0
+	for p.match(tokLBracket) {
+		depth++
+	}
+	if !p.match(tokName) {
+		return fmt.Errorf("expected a type, got %q", p.peek().text)
+	}
+	p.match(tokBang)
+	for range depth {
 		if _, err := p.expect(tokRBracket); err != nil {
 			return err
 		}
-	case tokName:
-		p.take()
-	default:
-		return fmt.Errorf("expected a type, got %q", p.peek().text)
-	}
-	if p.peek().kind == tokBang {
-		p.take()
+		p.match(tokBang)
 	}
 	return nil
 }
 
 func (p *gqlParser) skipDirectives() error {
-	for p.peek().kind == tokAt {
-		p.take()
+	for p.match(tokAt) {
 		if _, err := p.expect(tokName); err != nil {
 			return err
 		}
-		if p.peek().kind == tokLParen {
-			if _, err := p.parseArguments(); err != nil {
+		if p.match(tokLParen) {
+			if _, err := p.parseNamedValues(tokRParen); err != nil {
 				return err
 			}
 		}
@@ -413,12 +407,22 @@ func (p *gqlParser) skipDirectives() error {
 	return nil
 }
 
+func (p *gqlParser) directedSelectionSet(optional bool) (*gqlSelectionSet, error) {
+	if err := p.skipDirectives(); err != nil {
+		return nil, err
+	}
+	if optional && p.peek().kind != tokLBrace {
+		return nil, nil
+	}
+	return p.parseSelectionSet()
+}
+
 func (p *gqlParser) parseSelectionSet() (*gqlSelectionSet, error) {
 	if _, err := p.expect(tokLBrace); err != nil {
 		return nil, err
 	}
-	set := &gqlSelectionSet{}
-	for p.peek().kind != tokRBrace {
+	var selections []gqlSelection
+	for !p.match(tokRBrace) {
 		if p.peek().kind == tokEOF {
 			return nil, fmt.Errorf("unterminated selection set")
 		}
@@ -426,55 +430,21 @@ func (p *gqlParser) parseSelectionSet() (*gqlSelectionSet, error) {
 		if err != nil {
 			return nil, err
 		}
-		set.sels = append(set.sels, sel)
+		selections = append(selections, sel)
 	}
-	if _, err := p.expect(tokRBrace); err != nil {
-		return nil, err
-	}
-	return set, nil
+	return &gqlSelectionSet{sels: selections}, nil
 }
 
 func (p *gqlParser) parseSelection() (gqlSelection, error) {
-	if p.peek().kind == tokSpread {
-		p.take()
-		if t := p.peek(); t.kind == tokName && t.text == "on" {
-			p.take()
-			typeTok, err := p.expect(tokName)
-			if err != nil {
-				return gqlSelection{}, err
-			}
-			if err := p.skipDirectives(); err != nil {
-				return gqlSelection{}, err
-			}
-			sel, err := p.parseSelectionSet()
-			if err != nil {
-				return gqlSelection{}, err
-			}
-			return gqlSelection{fragment: &gqlInlineFragment{typeCond: typeTok.text, sel: sel}}, nil
-		}
-		if p.peek().kind == tokName {
-			name := p.take().text
-			if err := p.skipDirectives(); err != nil {
-				return gqlSelection{}, err
-			}
-			return gqlSelection{spread: name}, nil
-		}
-		if err := p.skipDirectives(); err != nil {
-			return gqlSelection{}, err
-		}
-		sel, err := p.parseSelectionSet()
-		if err != nil {
-			return gqlSelection{}, err
-		}
-		return gqlSelection{fragment: &gqlInlineFragment{sel: sel}}, nil
+	if p.match(tokSpread) {
+		return p.parseSpread()
 	}
 	nameTok, err := p.expect(tokName)
 	if err != nil {
 		return gqlSelection{}, err
 	}
 	f := &gqlField{name: nameTok.text}
-	if p.peek().kind == tokColon {
-		p.take()
+	if p.match(tokColon) {
 		fieldTok, err := p.expect(tokName)
 		if err != nil {
 			return gqlSelection{}, err
@@ -482,32 +452,41 @@ func (p *gqlParser) parseSelection() (gqlSelection, error) {
 		f.alias = f.name
 		f.name = fieldTok.text
 	}
-	if p.peek().kind == tokLParen {
-		args, err := p.parseArguments()
+	if p.match(tokLParen) {
+		args, err := p.parseNamedValues(tokRParen)
 		if err != nil {
 			return gqlSelection{}, err
 		}
 		f.args = args
 	}
-	if err := p.skipDirectives(); err != nil {
+	f.sel, err = p.directedSelectionSet(true)
+	if err != nil {
 		return gqlSelection{}, err
-	}
-	if p.peek().kind == tokLBrace {
-		sel, err := p.parseSelectionSet()
-		if err != nil {
-			return gqlSelection{}, err
-		}
-		f.sel = sel
 	}
 	return gqlSelection{field: f}, nil
 }
 
-func (p *gqlParser) parseArguments() ([]gqlArg, error) {
-	if _, err := p.expect(tokLParen); err != nil {
-		return nil, err
+func (p *gqlParser) parseSpread() (gqlSelection, error) {
+	var typeCondition string
+	if p.matchName("on") {
+		t, err := p.expect(tokName)
+		if err != nil {
+			return gqlSelection{}, err
+		}
+		typeCondition = t.text
+	} else if p.peek().kind == tokName {
+		name := p.take().text
+		return gqlSelection{spread: name}, p.skipDirectives()
 	}
-	var args []gqlArg
-	for p.peek().kind != tokRParen {
+	selection, err := p.directedSelectionSet(false)
+	return gqlSelection{fragment: &gqlInlineFragment{typeCond: typeCondition, sel: selection}}, err
+}
+
+// Arguments and input objects have the same name/value grammar. Retain their
+// source order so duplicate names keep the last value during evaluation.
+func (p *gqlParser) parseNamedValues(close gqlTokenKind) ([]gqlArg, error) {
+	pairs := make([]gqlArg, 0)
+	for !p.match(close) {
 		name, err := p.expect(tokName)
 		if err != nil {
 			return nil, err
@@ -519,95 +498,77 @@ func (p *gqlParser) parseArguments() ([]gqlArg, error) {
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, gqlArg{name: name.text, value: value})
+		pairs = append(pairs, gqlArg{name: name.text, value: value})
 	}
-	if _, err := p.expect(tokRParen); err != nil {
-		return nil, err
-	}
-	return args, nil
+	return pairs, nil
 }
 
-func (p *gqlParser) parseValue() (*gqlValue, error) {
+func (p *gqlParser) parseValue() (gqlValue, error) {
 	t := p.take()
 	switch t.kind {
 	case tokDollar:
 		name, err := p.expect(tokName)
-		if err != nil {
-			return nil, err
-		}
-		return &gqlValue{kind: "var", name: name.text}, nil
+		return gqlValue{variable: name.text}, err
 	case tokInt:
-		return &gqlValue{kind: "int", num: t.text}, nil
+		n, err := strconv.ParseInt(t.text, 10, 64)
+		if err != nil {
+			n = 0
+		}
+		return gqlValue{literal: int(n)}, nil
 	case tokFloat:
-		return &gqlValue{kind: "float", num: t.text}, nil
+		n, err := strconv.ParseFloat(t.text, 64)
+		if err != nil {
+			n = 0
+		}
+		return gqlValue{literal: n}, nil
 	case tokString:
-		return &gqlValue{kind: "string", str: t.text}, nil
+		return gqlValue{literal: t.text}, nil
 	case tokLBracket:
-		v := &gqlValue{kind: "list"}
-		for p.peek().kind != tokRBracket {
-			elem, err := p.parseValue()
-			if err != nil {
-				return nil, err
-			}
-			v.list = append(v.list, elem)
-		}
-		if _, err := p.expect(tokRBracket); err != nil {
-			return nil, err
-		}
-		return v, nil
+		list, err := p.parseList()
+		return gqlValue{list: list}, err
 	case tokLBrace:
-		v := &gqlValue{kind: "object"}
-		for p.peek().kind != tokRBrace {
-			name, err := p.expect(tokName)
-			if err != nil {
-				return nil, err
-			}
-			if _, err := p.expect(tokColon); err != nil {
-				return nil, err
-			}
-			elem, err := p.parseValue()
-			if err != nil {
-				return nil, err
-			}
-			v.object = append(v.object, gqlObjectField{name: name.text, value: elem})
-		}
-		if _, err := p.expect(tokRBrace); err != nil {
-			return nil, err
-		}
-		return v, nil
+		fields, err := p.parseNamedValues(tokRBrace)
+		return gqlValue{object: fields}, err
 	case tokName:
 		switch t.text {
 		case "true":
-			return &gqlValue{kind: "bool", boolean: true}, nil
+			return gqlValue{literal: true}, nil
 		case "false":
-			return &gqlValue{kind: "bool", boolean: false}, nil
+			return gqlValue{literal: false}, nil
 		case "null":
-			return &gqlValue{kind: "null"}, nil
+			return gqlValue{}, nil
 		default:
-			return &gqlValue{kind: "enum", name: t.text}, nil
+			return gqlValue{literal: t.text}, nil
 		}
 	}
-	return nil, fmt.Errorf("unexpected value token %q", t.text)
+	return gqlValue{}, fmt.Errorf("unexpected value token %q", t.text)
+}
+
+func (p *gqlParser) parseList() ([]gqlValue, error) {
+	values := make([]gqlValue, 0)
+	for !p.match(tokRBracket) {
+		value, err := p.parseValue()
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, nil
 }
 
 func (p *gqlParser) parseFragment() (*gqlFragmentDef, error) {
-	p.take() // "fragment"
 	name, err := p.expect(tokName)
 	if err != nil {
 		return nil, err
 	}
-	on, err := p.expect(tokName)
-	if err != nil || on.text != "on" {
+	if !p.matchName("on") {
 		return nil, fmt.Errorf("expected 'on' in a fragment definition")
 	}
 	typeTok, err := p.expect(tokName)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.skipDirectives(); err != nil {
-		return nil, err
-	}
-	sel, err := p.parseSelectionSet()
+	sel, err := p.directedSelectionSet(false)
 	if err != nil {
 		return nil, err
 	}
@@ -617,46 +578,29 @@ func (p *gqlParser) parseFragment() (*gqlFragmentDef, error) {
 // ---------------------------------------------------------------------------
 // Values and global ids
 
-// evalValue resolves a value node against the operation's variables.
-func evalValue(v *gqlValue, vars map[string]any) any {
-	switch v.kind {
-	case "var":
-		if vars == nil {
-			return nil
+func (v gqlValue) evaluate(vars map[string]any) any {
+	switch {
+	case v.variable != "":
+		return vars[v.variable]
+	case v.list != nil:
+		values := make([]any, len(v.list))
+		for i, element := range v.list {
+			values[i] = element.evaluate(vars)
 		}
-		return vars[v.name]
-	case "int":
-		if n, err := strconv.ParseInt(v.num, 10, 64); err == nil {
-			return int(n)
-		}
-		return 0
-	case "float":
-		if f, err := strconv.ParseFloat(v.num, 64); err == nil {
-			return f
-		}
-		return 0.0
-	case "string":
-		return v.str
-	case "bool":
-		return v.boolean
-	case "null":
-		return nil
-	case "enum":
-		return v.name
-	case "list":
-		out := make([]any, 0, len(v.list))
-		for _, e := range v.list {
-			out = append(out, evalValue(e, vars))
-		}
-		return out
-	case "object":
-		out := map[string]any{}
-		for _, f := range v.object {
-			out[f.name] = evalValue(f.value, vars)
-		}
-		return out
+		return values
+	case v.object != nil:
+		return evaluateGQLPairs(v.object, vars)
+	default:
+		return v.literal
 	}
-	return nil
+}
+
+func evaluateGQLPairs(pairs []gqlArg, vars map[string]any) map[string]any {
+	values := make(map[string]any, len(pairs))
+	for _, pair := range pairs {
+		values[pair.name] = pair.value.evaluate(vars)
+	}
+	return values
 }
 
 func toInt(v any) (int, bool) {
@@ -726,7 +670,7 @@ type gqlNode struct {
 }
 
 type gqlError struct {
-	message string
+	Message string `json:"message"`
 }
 
 type gqlExecutor struct {
@@ -954,12 +898,8 @@ func resolveNode(e *gqlExecutor, obj any, args map[string]any) (any, error) {
 	switch parts[0] {
 	case "R":
 		if len(parts) == 2 {
-			if dbid, err := strconv.Atoi(parts[1]); err == nil {
-				for _, r := range e.srv.st.order {
-					if r.id == dbid {
-						return &gqlNode{typ: "Repository", val: r}, nil
-					}
-				}
+			if r := e.repositoryByNumber(parts[1]); r != nil {
+				return &gqlNode{typ: "Repository", val: r}, nil
 			}
 		}
 	case "I":
@@ -974,40 +914,32 @@ func resolveNode(e *gqlExecutor, obj any, args map[string]any) (any, error) {
 	return nil, nil
 }
 
-// lookupIssue resolves ["I", repoId, number] to an issue reference.
-func (e *gqlExecutor) lookupIssue(parts []string) *issueRef {
+// numberedNode decodes the common repository/number suffix of issue and pull
+// IDs. The callers retain control of which node kinds they accept.
+func (e *gqlExecutor) numberedNode(parts []string) (*repository, int) {
 	if len(parts) != 3 {
-		return nil
+		return nil, 0
 	}
-	dbid, err1 := strconv.Atoi(parts[1])
-	number, err2 := strconv.Atoi(parts[2])
-	if err1 != nil || err2 != nil {
-		return nil
+	number, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return nil, 0
 	}
-	for _, r := range e.srv.st.order {
-		if r.id == dbid {
-			if it := r.issuesByNum[number]; it != nil {
-				return &issueRef{repo: r, issue: it}
-			}
+	return e.repositoryByNumber(parts[1]), number
+}
+
+func (e *gqlExecutor) lookupIssue(parts []string) *issueRef {
+	if r, n := e.numberedNode(parts); r != nil {
+		if it := r.issuesByNum[n]; it != nil {
+			return &issueRef{repo: r, issue: it}
 		}
 	}
 	return nil
 }
 
 func (e *gqlExecutor) lookupPull(parts []string) *pullRef {
-	if len(parts) != 3 {
-		return nil
-	}
-	dbid, err1 := strconv.Atoi(parts[1])
-	number, err2 := strconv.Atoi(parts[2])
-	if err1 != nil || err2 != nil {
-		return nil
-	}
-	for _, r := range e.srv.st.order {
-		if r.id == dbid {
-			if pr := r.pullsByNum[number]; pr != nil {
-				return &pullRef{repo: r, pr: pr}
-			}
+	if r, n := e.numberedNode(parts); r != nil {
+		if pr := r.pullsByNum[n]; pr != nil {
+			return &pullRef{repo: r, pr: pr}
 		}
 	}
 	return nil
@@ -1018,16 +950,15 @@ func (e *gqlExecutor) lookupRepoByID(id string) *repository {
 	if !ok || len(parts) != 2 || parts[0] != "R" {
 		return nil
 	}
-	dbid, err := strconv.Atoi(parts[1])
+	return e.repositoryByNumber(parts[1])
+}
+
+func (e *gqlExecutor) repositoryByNumber(text string) *repository {
+	dbid, err := strconv.Atoi(text)
 	if err != nil {
 		return nil
 	}
-	for _, r := range e.srv.st.order {
-		if r.id == dbid {
-			return r
-		}
-	}
-	return nil
+	return e.srv.st.reposByID[dbid]
 }
 
 func resolveType(e *gqlExecutor, obj any, args map[string]any) (any, error) {
@@ -1071,97 +1002,80 @@ func resolveIssueField(e *gqlExecutor, obj any, args map[string]any) (any, error
 	if !ok {
 		return nil, nil
 	}
-	it := r.issuesByNum[number]
-	if it == nil {
-		return nil, nil
+	if it := r.issuesByNum[number]; it != nil {
+		return issueNode(r, it), nil
 	}
-	return &gqlNode{typ: "Issue", val: &issueRef{repo: r, issue: it}}, nil
+	return nil, nil
+}
+
+func issueNode(r *repository, it *issue) *gqlNode {
+	return &gqlNode{typ: "Issue", val: &issueRef{repo: r, issue: it}}
+}
+
+type gqlIssueStates uint8
+
+const (
+	gqlOpen gqlIssueStates = 1 << iota
+	gqlClosed
+)
+
+func gqlReadIssueStates(value any) gqlIssueStates {
+	if value == nil {
+		return gqlOpen | gqlClosed
+	}
+	var states gqlIssueStates
+	list, _ := value.([]any)
+	for _, item := range list {
+		switch item {
+		case "OPEN":
+			states |= gqlOpen
+		case "CLOSED":
+			states |= gqlClosed
+		}
+	}
+	return states
+}
+
+func (states gqlIssueStates) includes(it *issue) bool {
+	switch it.state {
+	case "open":
+		return states&gqlOpen != 0
+	case "closed":
+		return states&gqlClosed != 0
+	default:
+		return true
+	}
 }
 
 func resolveIssuesField(e *gqlExecutor, obj any, args map[string]any) (any, error) {
 	r := obj.(*repository)
-	// States filter: a list of OPEN/CLOSED, or all states when absent.
-	var wantOpen, wantClosed bool
-	if raw, ok := args["states"]; ok && raw != nil {
-		if list, ok := raw.([]any); ok {
-			for _, s := range list {
-				if str, ok := toString(s); ok {
-					if str == "OPEN" {
-						wantOpen = true
-					}
-					if str == "CLOSED" {
-						wantClosed = true
-					}
-				}
-			}
-		}
-	} else {
-		wantOpen, wantClosed = true, true
+	states := gqlReadIssueStates(args["states"])
+	order, _ := toMap(args["orderBy"])
+	direction, _ := toString(order["direction"])
+	ordered := selectInOrder(r.issues, direction != "ASC", states.includes)
+	page, hasNext := sliceIssueConnection(ordered, args)
+	nodes := make([]*gqlNode, len(page))
+	for i, it := range page {
+		nodes[i] = issueNode(r, it)
 	}
-	// Order: CREATED_AT DESC is the default; ASC reverses it.
-	desc := true
-	if raw, ok := args["orderBy"]; ok {
-		if ob, ok := toMap(raw); ok {
-			if dir, ok := toString(ob["direction"]); ok && dir == "ASC" {
-				desc = false
-			}
-		}
+	info := &pageInfo{hasNext: hasNext}
+	if n := len(page); n > 0 {
+		info.endCursor = encodeCursor(page[n-1].number)
 	}
-	var ordered []*issue
-	for _, it := range r.issues {
-		if it.state == "open" && !wantOpen {
-			continue
-		}
-		if it.state == "closed" && !wantClosed {
-			continue
-		}
-		ordered = append(ordered, it)
+	return &gqlNode{typ: "IssueConnection", val: &issueConn{nodes: nodes, page: info}}, nil
+}
+
+func sliceIssueConnection(issues []*issue, args map[string]any) ([]*issue, bool) {
+	cursor, _ := toString(args["after"])
+	if number, valid := decodeCursor(cursor); valid {
+		// An absent or stale cursor leaves the connection at its first item.
+		index := slices.IndexFunc(issues, func(it *issue) bool { return it.number == number })
+		issues = issues[index+1:]
 	}
-	if desc {
-		for i, j := 0, len(ordered)-1; i < j; i, j = i+1, j-1 {
-			ordered[i], ordered[j] = ordered[j], ordered[i]
-		}
+	if limit, valid := toInt(args["first"]); valid && limit >= 0 && limit < len(issues) {
+		return issues[:limit], true
 	}
-	// Cursor: continue after the issue the cursor names.
-	start := 0
-	if raw, ok := args["after"]; ok && raw != nil {
-		if cursor, ok := toString(raw); ok && cursor != "" {
-			if num, ok := decodeCursor(cursor); ok {
-				for i, it := range ordered {
-					if it.number == num {
-						start = i + 1
-						break
-					}
-				}
-			}
-		}
-	}
-	first := len(ordered)
-	if raw, ok := args["first"]; ok {
-		if n, ok := toInt(raw); ok && n >= 0 {
-			first = n
-		}
-	}
-	end := start + first
-	if end > len(ordered) {
-		end = len(ordered)
-	}
-	if start > len(ordered) {
-		start = len(ordered)
-	}
-	page := ordered[start:end]
-	nodes := make([]*gqlNode, 0, len(page))
-	for _, it := range page {
-		nodes = append(nodes, &gqlNode{typ: "Issue", val: &issueRef{repo: r, issue: it}})
-	}
-	var endCursor any
-	if len(page) > 0 {
-		endCursor = encodeCursor(page[len(page)-1].number)
-	}
-	return &gqlNode{typ: "IssueConnection", val: &issueConn{
-		nodes: nodes,
-		page:  &pageInfo{hasNext: end < len(ordered), endCursor: endCursor},
-	}}, nil
+	return issues, false
 }
 
 func encodeCursor(number int) string {
@@ -1384,78 +1298,94 @@ func (e *gqlExecutor) execute(op *gqlOperation) map[string]any {
 		rootType = "Mutation"
 	}
 	root := &gqlNode{typ: rootType}
-	return e.executeSelectionSet(op.sel, root)
+	return e.executeSelectionSet(op.sel, root, nil)
 }
 
-func (e *gqlExecutor) executeSelectionSet(sel *gqlSelectionSet, obj *gqlNode) map[string]any {
-	out := map[string]any{}
+func (e *gqlExecutor) executeSelectionSet(sel *gqlSelectionSet, obj *gqlNode, path *gqlFragmentPath) map[string]any {
 	if sel == nil || obj == nil {
-		return out
+		return map[string]any{}
 	}
-	for _, s := range sel.sels {
-		switch {
-		case s.field != nil:
-			key := s.field.name
-			if s.field.alias != "" {
-				key = s.field.alias
-			}
-			out[key] = e.executeField(s.field, obj)
-		case s.fragment != nil:
-			if s.fragment.typeCond == "" || s.fragment.typeCond == obj.typ {
-				for k, v := range e.executeSelectionSet(s.fragment.sel, obj) {
-					out[k] = v
-				}
-			}
-		case s.spread != "":
-			if def, ok := e.doc.fragments[s.spread]; ok {
-				if def.typeCond == "" || def.typeCond == obj.typ {
-					for k, v := range e.executeSelectionSet(def.sel, obj) {
-						out[k] = v
-					}
-				}
-			}
-		}
-	}
+	out := make(map[string]any, len(sel.sels))
+	e.projectSelections(out, sel, obj, path)
 	return out
 }
 
-func (e *gqlExecutor) executeField(f *gqlField, obj *gqlNode) any {
-	table := fieldTables[obj.typ]
-	def, ok := table[f.name]
-	if !ok {
-		e.errs = append(e.errs, gqlError{message: fmt.Sprintf("Cannot query field %q on type %q.", f.name, obj.typ)})
-		return nil
-	}
-	args := map[string]any{}
-	for _, a := range f.args {
-		args[a.name] = evalValue(a.value, e.vars)
-	}
-	value, err := def.resolve(e, obj.val, args)
-	if err != nil {
-		e.errs = append(e.errs, gqlError{message: err.Error()})
-		return nil
-	}
-	if value == nil {
-		return nil
-	}
-	if f.sel == nil {
-		// A leaf: scalars pass through; an object without a selection set is
-		// an error in GraphQL, but the documents never do that.
-		if node, ok := value.(*gqlNode); ok {
-			_ = node
-			return nil
+type gqlFragmentPath struct {
+	definition *gqlFragmentDef
+	parent     *gqlFragmentPath
+}
+
+// Inline fragments and spreads project into the same response object, in
+// encounter order. This also preserves resolver error and mutation order.
+func (e *gqlExecutor) projectSelections(out map[string]any, sel *gqlSelectionSet, obj *gqlNode, path *gqlFragmentPath) {
+	for _, selection := range sel.sels {
+		if f := selection.field; f != nil {
+			key := f.alias
+			if key == "" {
+				key = f.name
+			}
+			out[key] = e.executeField(f, obj, path)
+			continue
 		}
-		return value
+		if inline := selection.fragment; inline != nil {
+			if gqlTypeMatches(inline.typeCond, obj.typ) {
+				e.projectSelections(out, inline.sel, obj, path)
+			}
+			continue
+		}
+		definition := e.doc.fragments[selection.spread]
+		if definition == nil || !gqlTypeMatches(definition.typeCond, obj.typ) {
+			continue
+		}
+		if path.contains(definition) {
+			e.addError(fmt.Sprintf("Cannot spread fragment %q within itself.", definition.name))
+			continue
+		}
+		e.projectSelections(out, definition.sel, obj, &gqlFragmentPath{definition: definition, parent: path})
+	}
+}
+
+func gqlTypeMatches(want, actual string) bool { return want == "" || want == actual }
+
+func (p *gqlFragmentPath) contains(definition *gqlFragmentDef) bool {
+	for ; p != nil; p = p.parent {
+		if p.definition == definition {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *gqlExecutor) addError(message string) {
+	e.errs = append(e.errs, gqlError{Message: message})
+}
+
+func (e *gqlExecutor) executeField(f *gqlField, obj *gqlNode, path *gqlFragmentPath) any {
+	def, ok := fieldTables[obj.typ][f.name]
+	if !ok {
+		e.addError(fmt.Sprintf("Cannot query field %q on type %q.", f.name, obj.typ))
+		return nil
+	}
+	value, err := def.resolve(e, obj.val, evaluateGQLPairs(f.args, e.vars))
+	if err != nil {
+		e.addError(err.Error())
+		return nil
 	}
 	switch v := value.(type) {
 	case *gqlNode:
-		return e.executeSelectionSet(f.sel, v)
-	case []*gqlNode:
-		out := make([]any, 0, len(v))
-		for _, n := range v {
-			out = append(out, e.executeSelectionSet(f.sel, n))
+		if f.sel == nil {
+			return nil
 		}
-		return out
+		return e.executeSelectionSet(f.sel, v, path)
+	case []*gqlNode:
+		if f.sel == nil {
+			return value
+		}
+		items := make([]any, len(v))
+		for i, n := range v {
+			items[i] = e.executeSelectionSet(f.sel, n, path)
+		}
+		return items
 	default:
 		return value
 	}
@@ -1468,61 +1398,61 @@ func (e *gqlExecutor) executeField(f *gqlField, obj *gqlNode) any {
 func (s *server) handleGraphQL(q *request) response {
 	trimmed := strings.TrimSpace(string(q.body))
 	if trimmed == "" {
-		return jsonResponse(400, mustJSON(map[string]any{"errors": []map[string]string{{"message": "the request body is empty"}}}))
+		return jsonResponse(400, mustJSON(gqlFailure("the request body is empty")))
 	}
-	if strings.HasPrefix(trimmed, "[") {
-		var ops []map[string]any
-		if err := json.Unmarshal(q.body, &ops); err != nil {
-			return jsonResponse(400, mustJSON(map[string]any{"errors": []map[string]string{{"message": "the request body is not JSON"}}}))
-		}
-		results := make([]any, 0, len(ops))
-		for _, op := range ops {
-			results = append(results, s.runGraphQLOperation(op))
-		}
-		return jsonResponse(200, mustJSON(results))
+	if trimmed[0] == '[' {
+		return s.handleGraphQLBatch(q.body)
 	}
 	var op map[string]any
 	if err := json.Unmarshal(q.body, &op); err != nil {
-		return jsonResponse(400, mustJSON(map[string]any{"errors": []map[string]string{{"message": "the request body is not JSON"}}}))
+		return jsonResponse(400, mustJSON(gqlFailure("the request body is not JSON")))
 	}
 	return jsonResponse(200, mustJSON(s.runGraphQLOperation(op)))
+}
+
+func (s *server) handleGraphQLBatch(body []byte) response {
+	var operations []map[string]any
+	if err := json.Unmarshal(body, &operations); err != nil {
+		return jsonResponse(400, mustJSON(gqlFailure("the request body is not JSON")))
+	}
+	results := make([]map[string]any, len(operations))
+	for i, operation := range operations {
+		results[i] = s.runGraphQLOperation(operation)
+	}
+	return jsonResponse(200, mustJSON(results))
+}
+
+func gqlFailure(message string) map[string]any {
+	return map[string]any{"errors": []gqlError{{Message: message}}}
+}
+
+func (d *gqlDocument) chooseOperation(name string) *gqlOperation {
+	if name != "" {
+		for _, operation := range d.operations {
+			if operation.name == name {
+				return operation
+			}
+		}
+	}
+	return d.operations[0]
 }
 
 func (s *server) runGraphQLOperation(op map[string]any) map[string]any {
 	query, _ := toString(op["query"])
 	if query == "" {
-		return map[string]any{"errors": []map[string]string{{"message": "the request carries no query"}}}
-	}
-	vars := map[string]any{}
-	if raw, ok := op["variables"]; ok {
-		if m, ok := toMap(raw); ok {
-			vars = m
-		}
+		return gqlFailure("the request carries no query")
 	}
 	doc, err := parseGraphQLDocument(query)
 	if err != nil {
-		return map[string]any{"errors": []map[string]string{{"message": err.Error()}}}
+		return gqlFailure(err.Error())
 	}
 	// The operation name selects among several; with one operation it is it.
 	operationName, _ := toString(op["operationName"])
-	operation := doc.operations[0]
-	if operationName != "" {
-		for _, cand := range doc.operations {
-			if cand.name == operationName {
-				operation = cand
-				break
-			}
-		}
-	}
+	vars, _ := toMap(op["variables"])
 	ex := &gqlExecutor{srv: s, vars: vars, doc: doc}
-	data := ex.execute(operation)
-	envelope := map[string]any{"data": data}
+	envelope := map[string]any{"data": ex.execute(doc.chooseOperation(operationName))}
 	if len(ex.errs) > 0 {
-		errList := make([]map[string]string, 0, len(ex.errs))
-		for _, e := range ex.errs {
-			errList = append(errList, map[string]string{"message": e.message})
-		}
-		envelope["errors"] = errList
+		envelope["errors"] = ex.errs
 	}
 	return envelope
 }

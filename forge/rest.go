@@ -21,10 +21,7 @@ import (
 // dispatch routes one request and stamps every response with a request id.
 func (s *server) dispatch(q *request) response {
 	resp := s.route(q)
-	if resp.headers == nil {
-		resp.headers = map[string]string{}
-	}
-	resp.headers["X-GitHub-Request-Id"] = s.st.nextRequestID()
+	resp.requestID = s.st.reqSeq.Add(1)
 	return resp
 }
 
@@ -62,78 +59,13 @@ func (s *server) route(q *request) response {
 			return jsonError(401, "Requires authentication")
 		}
 		resp := s.handleREST(q)
-		if resp.headers == nil {
-			resp.headers = map[string]string{}
-		}
-		resp.headers["X-OAuth-Scopes"] = "repo, read:org, user"
+		resp.oauthScopes = true
 		return resp
 	}
 	if resp, ok := s.routeGit(q); ok {
 		return resp
 	}
 	return jsonError(404, "Not Found")
-}
-
-// routeGit handles /{owner}/{repo}.git/info/refs and the two smart-HTTP
-// POST endpoints. It answers ok=false when the path is not a git path.
-func (s *server) routeGit(q *request) (response, bool) {
-	segs := q.segments()
-	if len(segs) < 3 || !strings.HasSuffix(segs[1], ".git") {
-		return response{}, false
-	}
-	owner, repoName := segs[0], strings.TrimSuffix(segs[1], ".git")
-	isInfoRefs := len(segs) == 4 && segs[2] == "info" && segs[3] == "refs"
-	isUpload := len(segs) == 3 && segs[2] == "git-upload-pack"
-	isReceive := len(segs) == 3 && segs[2] == "git-receive-pack"
-	if !isInfoRefs && !isUpload && !isReceive {
-		return response{}, false
-	}
-	if !s.authorized(q) {
-		return jsonError(401, "Requires authentication"), true
-	}
-	if isInfoRefs {
-		if q.method != "GET" {
-			return jsonError(404, "Not Found"), true
-		}
-		service := q.queryValue("service")
-		s.st.mu.RLock()
-		defer s.st.mu.RUnlock()
-		r := s.st.repo(owner, repoName)
-		if r == nil {
-			return jsonError(404, "Not Found"), true
-		}
-		switch service {
-		case "git-upload-pack":
-			if q.header("git-protocol") == "version=2" {
-				return response{status: 200, contentType: "application/x-git-upload-pack-advertisement", body: advertiseV2(service)}, true
-			}
-			return response{status: 200, contentType: "application/x-git-upload-pack-advertisement", body: advertiseV0(r, service, uploadPackCapsV0)}, true
-		case "git-receive-pack":
-			return response{status: 200, contentType: "application/x-git-receive-pack-advertisement", body: advertiseV0(r, service, receivePackCapsV0)}, true
-		}
-		return jsonError(400, "unknown service"), true
-	}
-	if q.method != "POST" {
-		return jsonError(404, "Not Found"), true
-	}
-	if isUpload {
-		s.st.mu.RLock()
-		defer s.st.mu.RUnlock()
-		r := s.st.repo(owner, repoName)
-		if r == nil {
-			return jsonError(404, "Not Found"), true
-		}
-		body, contentType, status := handleUploadPackPOST(r, q.body)
-		return response{status: status, contentType: contentType, body: body}, true
-	}
-	s.st.mu.Lock()
-	defer s.st.mu.Unlock()
-	r := s.st.repo(owner, repoName)
-	if r == nil {
-		return jsonError(404, "Not Found"), true
-	}
-	body, contentType, status := handleReceivePackPOST(r, q.body)
-	return response{status: status, contentType: contentType, body: body}, true
 }
 
 // ---------------------------------------------------------------------------
@@ -510,19 +442,7 @@ func (s *server) handleUser(q *request, rest []string) response {
 		case "GET":
 			s.st.mu.RLock()
 			defer s.st.mu.RUnlock()
-			repos := s.st.reposOf(s.st.viewerLogin)
-			page := q.queryInt("page", 1)
-			perPage := q.queryInt("per_page", 30)
-			start, end, hasNext := paginate(len(repos), page, perPage)
-			views := make([]repoJSON, 0, end-start)
-			for _, r := range repos[start:end] {
-				views = append(views, s.repoView(r))
-			}
-			resp := jsonResponse(200, mustJSON(views))
-			if hasNext {
-				resp.headers = map[string]string{"Link": q.linkNext(page+1, perPage)}
-			}
-			return resp
+			return restPage(q, s.st.reposOf(s.st.viewerLogin), s.repoView)
 		case "POST":
 			body, ok := parseBody(q)
 			if !ok {
@@ -549,6 +469,48 @@ func (s *server) handleUser(q *request, rest []string) response {
 // lookupRepo resolves /repos/{owner}/{repo} under the caller's lock.
 func (s *server) lookupRepo(owner, name string) *repository {
 	return s.st.repo(owner, name)
+}
+
+type repoRoute struct {
+	owner string
+	name  string
+}
+
+// Callbacks inspect the repository and serialize a snapshot before unlocking.
+// Body parsing stays at the endpoint so validation precedence is explicit.
+func (s *server) withRepo(key repoRoute, write bool, handler func(*repository) response) response {
+	if write {
+		s.st.mu.Lock()
+		defer s.st.mu.Unlock()
+	} else {
+		s.st.mu.RLock()
+		defer s.st.mu.RUnlock()
+	}
+	r := s.st.repo(key.owner, key.name)
+	if r == nil {
+		return restNotFound()
+	}
+	return handler(r)
+}
+
+func restNotFound() response { return jsonError(404, "Not Found") }
+
+func restBadJSON() response { return jsonError(400, "Problems parsing JSON") }
+
+func restJSON(status int, value any) response { return jsonResponse(status, mustJSON(value)) }
+
+func restPage[T, V any](q *request, ordered []T, view func(T) V) response {
+	page, size := q.queryInt("page", 1), q.queryInt("per_page", 30)
+	start, end, next := paginate(len(ordered), page, size)
+	result := make([]V, end-start)
+	for i, item := range ordered[start:end] {
+		result[i] = view(item)
+	}
+	resp := restJSON(200, result)
+	if next {
+		resp.nextLink = q.linkNext(page+1, size)
+	}
+	return resp
 }
 
 func (s *server) handleRepos(q *request, rest []string) response {
@@ -717,49 +679,30 @@ type contentEntryJSON struct {
 
 func (s *server) handleContents(q *request, owner, name string, tail []string) response {
 	path := strings.Join(tail, "/")
+	key := repoRoute{owner, name}
 	switch q.method {
 	case "GET":
-		s.st.mu.RLock()
-		defer s.st.mu.RUnlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
-		tip, ok := s.resolveRef(r, q.queryValue("ref"))
-		if !ok {
-			return jsonError(404, "Not Found")
-		}
-		c := r.commitOf(tip)
-		if c == nil {
-			return jsonError(404, "Not Found")
-		}
-		return s.contentsGet(r, c.tree, path)
-	case "PUT":
+		return s.withRepo(key, false, func(r *repository) response {
+			if tip, ok := s.resolveRef(r, q.queryValue("ref")); ok {
+				if commit := r.commitOf(tip); commit != nil {
+					return s.contentsGet(r, commit.tree, path)
+				}
+			}
+			return restNotFound()
+		})
+	case "PUT", "DELETE":
 		body, ok := parseBody(q)
 		if !ok {
-			return jsonError(400, "Problems parsing JSON")
+			return restBadJSON()
 		}
-		s.st.mu.Lock()
-		defer s.st.mu.Unlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
-		return s.contentsPut(r, path, body)
-	case "DELETE":
-		body, ok := parseBody(q)
-		if !ok {
-			return jsonError(400, "Problems parsing JSON")
-		}
-		s.st.mu.Lock()
-		defer s.st.mu.Unlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
-		return s.contentsDelete(r, path, body)
+		return s.withRepo(key, true, func(r *repository) response {
+			if q.method == "PUT" {
+				return s.contentsPut(r, path, body)
+			}
+			return s.contentsDelete(r, path, body)
+		})
 	}
-	return jsonError(404, "Not Found")
+	return restNotFound()
 }
 
 // contentsGet answers a file read or a directory listing.
@@ -774,14 +717,7 @@ func (s *server) contentsGet(r *repository, treeOid Oid, path string) response {
 		if o != nil {
 			data = o.data
 		}
-		name := path
-		if i := strings.LastIndexByte(path, '/'); i >= 0 {
-			name = path[i+1:]
-		}
-		return jsonResponse(200, mustJSON(contentFileJSON{
-			Type: "file", Encoding: "base64", Size: len(data), Name: name,
-			Path: path, SHA: oid.String(), Content: base64.StdEncoding.EncodeToString(data),
-		}))
+		return restJSON(200, fileContentView(path, oid, len(data), base64.StdEncoding.EncodeToString(data)))
 	}
 	// A directory?
 	if dirOid := r.treeAtPath(treeOid, path); !dirOid.IsZero() {
@@ -791,25 +727,87 @@ func (s *server) contentsGet(r *repository, treeOid Oid, path string) response {
 }
 
 func (s *server) contentsDir(r *repository, treeOid Oid, prefix string) response {
-	o := r.objects[treeOid]
-	entries := []contentEntryJSON{}
-	if o != nil && o.typ == objTree {
-		for _, e := range o.tree {
-			typ := "file"
-			size := 0
-			if e.isDir() {
-				typ = "dir"
-			} else if blob := r.objects[e.oid]; blob != nil {
-				size = len(blob.data)
-			}
-			p := e.name
-			if prefix != "" {
-				p = prefix + "/" + e.name
-			}
-			entries = append(entries, contentEntryJSON{Type: typ, Name: e.name, Path: p, SHA: e.oid.String(), Size: size})
+	var tree []treeEntry
+	if object := r.objects[treeOid]; object != nil && object.typ == objTree {
+		tree = object.tree
+	}
+	if prefix != "" {
+		prefix += "/"
+	}
+	entries := make([]contentEntryJSON, len(tree))
+	for i, entry := range tree {
+		item := contentEntryJSON{Type: "file", Name: entry.name, Path: prefix + entry.name, SHA: entry.oid.String()}
+		if entry.isDir() {
+			item.Type = "dir"
+		} else if object := r.objects[entry.oid]; object != nil {
+			item.Size = len(object.data)
+		}
+		entries[i] = item
+	}
+	return restJSON(200, entries)
+}
+
+func fileContentView(path string, oid Oid, size int, encoded string) contentFileJSON {
+	return contentFileJSON{
+		Type: "file", Encoding: "base64", Size: size,
+		Name: path[strings.LastIndexByte(path, '/')+1:], Path: path,
+		SHA: oid.String(), Content: encoded,
+	}
+}
+
+type contentsEdit struct {
+	ref      string
+	message  string
+	sha      Oid
+	hasSHA   bool
+	validSHA bool
+}
+
+func readContentsEdit(r *repository, body map[string]any) contentsEdit {
+	branch, _ := strField(body, "branch")
+	if branch == "" {
+		branch = r.defaultBranch
+	}
+	message, _ := strField(body, "message")
+	text, supplied := strField(body, "sha")
+	oid, valid := parseOid(text)
+	return contentsEdit{ref: branchRef(branch), message: message, sha: oid, hasSHA: supplied, validSHA: valid}
+}
+
+type contentSnapshot struct {
+	files  map[string]flatFile
+	parent Oid
+	hasTip bool
+}
+
+func (r *repository) contentSnapshot(ref string, fallback bool) contentSnapshot {
+	tip, exists := r.refs[ref]
+	if !exists && fallback {
+		tip, exists = r.refs[branchRef(r.defaultBranch)]
+	}
+	if exists {
+		if commit := r.commitOf(tip); commit != nil {
+			return contentSnapshot{files: r.flattenTree(commit.tree), parent: tip, hasTip: true}
 		}
 	}
-	return jsonResponse(200, mustJSON(entries))
+	return contentSnapshot{files: r.flattenTree(ZeroOid)}
+}
+
+func (s *server) commitContent(r *repository, edit contentsEdit, snapshot contentSnapshot) Oid {
+	var parents []Oid
+	if snapshot.hasTip {
+		parents = []Oid{snapshot.parent}
+	}
+	commit, _ := s.st.commitAsViewer(r, r.treeFromFlat(snapshot.files), parents, edit.message)
+	r.refs[edit.ref] = commit
+	return commit
+}
+
+func contentsResult(status int, file *contentFileJSON, commit Oid) response {
+	return restJSON(status, map[string]any{
+		"content": file,
+		"commit":  map[string]string{"sha": commit.String()},
+	})
 }
 
 // contentsPut creates or updates a file, committing on the named branch.
@@ -825,105 +823,41 @@ func (s *server) contentsPut(r *repository, path string, body map[string]any) re
 	if err != nil {
 		return jsonError(422, "content is not valid base64")
 	}
-	message, _ := strField(body, "message")
-	branch, hasBranch := strField(body, "branch")
-	if !hasBranch || branch == "" {
-		branch = r.defaultBranch
-	}
-	shaText, hasSha := strField(body, "sha")
-
-	refName := "refs/heads/" + branch
-	tip, exists := r.refs[refName]
-	var parentTree Oid
-	var parents []Oid
-	if exists {
-		if c := r.commitOf(tip); c != nil {
-			parentTree = c.tree
-			parents = []Oid{tip}
-		}
-	} else {
-		// A branch that does not exist yet starts from the default branch's
-		// tip, or from nothing on an unborn repository.
-		if defTip, ok := r.refs["refs/heads/"+r.defaultBranch]; ok && branch != r.defaultBranch {
-			if c := r.commitOf(defTip); c != nil {
-				parentTree = c.tree
-				parents = []Oid{defTip}
-			}
-		}
-	}
-	flat := r.flattenTree(parentTree)
-	creating := true
-	if cur, ok := flat[path]; ok {
-		creating = false
-		if !hasSha {
+	edit := readContentsEdit(r, body)
+	snapshot := r.contentSnapshot(edit.ref, true)
+	status := 201
+	if cur, exists := snapshot.files[path]; exists {
+		status = 200
+		if !edit.hasSHA {
 			return jsonError(422, "sha is required to update a file")
 		}
-		if want, ok := parseOid(shaText); !ok || want != cur.oid {
-			return jsonError(409, "the file changed since the given sha")
+		if !edit.validSHA || edit.sha != cur.oid {
+			return contentsConflict()
 		}
 	}
-	blobOid := r.putObject(objBlob, content)
-	flat[path] = flatFile{mode: "100644", oid: blobOid}
-	newTree := r.treeFromFlat(flat)
-	ts := s.st.nextTime()
-	identity := s.st.viewerName + " <" + s.st.viewerEmail + ">"
-	commitOid := r.buildCommitObject(newTree, parents, message, identity, identity, ts)
-	r.refs[refName] = commitOid
-
-	name := path
-	if i := strings.LastIndexByte(path, '/'); i >= 0 {
-		name = path[i+1:]
-	}
-	status := 201
-	if !creating {
-		status = 200
-	}
-	return jsonResponse(status, mustJSON(map[string]any{
-		"content": contentFileJSON{
-			Type: "file", Encoding: "base64", Size: len(content), Name: name,
-			Path: path, SHA: blobOid.String(), Content: contentB64,
-		},
-		"commit": map[string]string{"sha": commitOid.String()},
-	}))
+	blob := r.putObject(objBlob, content)
+	snapshot.files[path] = flatFile{mode: "100644", oid: blob}
+	file := fileContentView(path, blob, len(content), contentB64)
+	return contentsResult(status, &file, s.commitContent(r, edit, snapshot))
 }
 
 // contentsDelete removes a file, committing on the named branch.
 func (s *server) contentsDelete(r *repository, path string, body map[string]any) response {
-	branch, hasBranch := strField(body, "branch")
-	if !hasBranch || branch == "" {
-		branch = r.defaultBranch
+	edit := readContentsEdit(r, body)
+	snapshot := r.contentSnapshot(edit.ref, false)
+	current, exists := snapshot.files[path]
+	if !snapshot.hasTip || !exists {
+		return restNotFound()
 	}
-	message, _ := strField(body, "message")
-	shaText, hasSha := strField(body, "sha")
-	refName := "refs/heads/" + branch
-	tip, exists := r.refs[refName]
-	if !exists {
-		return jsonError(404, "Not Found")
+	if edit.hasSHA && (!edit.validSHA || current.oid != edit.sha) {
+		return contentsConflict()
 	}
-	c := r.commitOf(tip)
-	if c == nil {
-		return jsonError(404, "Not Found")
-	}
-	flat := r.flattenTree(c.tree)
-	cur, ok := flat[path]
-	if !ok {
-		return jsonError(404, "Not Found")
-	}
-	if hasSha {
-		if want, ok := parseOid(shaText); !ok || want != cur.oid {
-			return jsonError(409, "the file changed since the given sha")
-		}
-	}
-	delete(flat, path)
-	newTree := r.treeFromFlat(flat)
-	ts := s.st.nextTime()
-	identity := s.st.viewerName + " <" + s.st.viewerEmail + ">"
-	commitOid := r.buildCommitObject(newTree, []Oid{tip}, message, identity, identity, ts)
-	r.refs[refName] = commitOid
-	return jsonResponse(200, mustJSON(map[string]any{
-		"content": nil,
-		"commit":  map[string]string{"sha": commitOid.String()},
-	}))
+	delete(snapshot.files, path)
+	return contentsResult(200, nil, s.commitContent(r, edit, snapshot))
+}
+
+func contentsConflict() response {
+	return jsonError(409, "the file changed since the given sha")
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,323 +1010,239 @@ func sortStrings(v []string) {
 // Issues and comments
 
 func (s *server) handleIssues(q *request, owner, name string, tail []string) response {
-	// /issues
+	key := repoRoute{owner, name}
 	if len(tail) == 0 {
-		switch q.method {
-		case "GET":
-			s.st.mu.RLock()
-			defer s.st.mu.RUnlock()
-			r := s.lookupRepo(owner, name)
-			if r == nil {
-				return jsonError(404, "Not Found")
-			}
-			return s.listIssues(q, r)
-		case "POST":
-			body, ok := parseBody(q)
-			if !ok {
-				return jsonError(400, "Problems parsing JSON")
-			}
-			title, hasTitle := strField(body, "title")
-			if !hasTitle || title == "" {
-				return jsonError(422, "title is required")
-			}
-			bodyText, _ := strField(body, "body")
-			labels := strListField(body, "labels")
-			s.st.mu.Lock()
-			defer s.st.mu.Unlock()
-			r := s.lookupRepo(owner, name)
-			if r == nil {
-				return jsonError(404, "Not Found")
-			}
-			for _, l := range labels {
-				if _, ok := r.labels[l]; !ok {
-					return jsonError(422, "the label "+l+" does not exist")
-				}
-			}
-			it := s.st.createIssue(r, title, bodyText, labels)
-			return jsonResponse(201, mustJSON(s.issueView(r, it)))
-		}
-		return jsonError(404, "Not Found")
+		return s.issueCollection(q, key)
 	}
-	// /issues/{n}[/comments]
 	number, err := strconv.Atoi(tail[0])
 	if err != nil {
-		return jsonError(404, "Not Found")
+		return restNotFound()
 	}
 	if len(tail) == 2 && tail[1] == "comments" {
-		return s.handleComments(q, owner, name, number)
+		return s.handleComments(q, key, number)
 	}
 	if len(tail) != 1 {
-		return jsonError(404, "Not Found")
+		return restNotFound()
 	}
-	switch q.method {
-	case "GET":
-		s.st.mu.RLock()
-		defer s.st.mu.RUnlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
-		it := r.issuesByNum[number]
-		if it == nil {
-			return jsonError(404, "Not Found")
-		}
-		return jsonResponse(200, mustJSON(s.issueView(r, it)))
-	case "PATCH":
-		body, ok := parseBody(q)
+	write := q.method == "PATCH"
+	if !write && q.method != "GET" {
+		return restNotFound()
+	}
+	var patch map[string]any
+	if write {
+		var ok bool
+		patch, ok = parseBody(q)
 		if !ok {
-			return jsonError(400, "Problems parsing JSON")
+			return restBadJSON()
 		}
-		s.st.mu.Lock()
-		defer s.st.mu.Unlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
-		it := r.issuesByNum[number]
-		if it == nil {
-			return jsonError(404, "Not Found")
-		}
-		if title, has := strField(body, "title"); has {
-			it.title = title
-		}
-		if text, has := strField(body, "body"); has {
-			it.body = text
-		}
-		if state, has := strField(body, "state"); has {
-			switch strings.ToLower(state) {
-			case "open", "closed":
-				it.state = strings.ToLower(state)
+	}
+	return s.withIssue(key, number, write, func(r *repository, it *issue) response {
+		if write {
+			if missing, invalid := applyIssuePatch(r, it, patch); invalid {
+				return missingLabel(missing)
 			}
 		}
-		if _, has := body["labels"]; has {
-			labels := strListField(body, "labels")
-			for _, l := range labels {
-				if _, ok := r.labels[l]; !ok {
-					return jsonError(422, "the label "+l+" does not exist")
-				}
-			}
-			it.labels = labels
-		}
-		return jsonResponse(200, mustJSON(s.issueView(r, it)))
-	}
-	return jsonError(404, "Not Found")
+		return restJSON(200, s.issueView(r, it))
+	})
 }
 
-// listIssues filters, sorts and pages a repository's issues.
-func (s *server) listIssues(q *request, r *repository) response {
-	state := q.queryValue("state")
-	if state == "" {
-		state = "open"
-	}
-	direction := q.queryValue("direction")
-	if direction == "" {
-		direction = "desc"
-	}
-	var filtered []*issue
-	for _, it := range r.issues {
-		if state != "all" && it.state != state {
-			continue
-		}
-		filtered = append(filtered, it)
-	}
-	// Creation order; desc reverses it.
-	if direction == "desc" {
-		for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
-			filtered[i], filtered[j] = filtered[j], filtered[i]
-		}
-	}
-	page := q.queryInt("page", 1)
-	perPage := q.queryInt("per_page", 30)
-	start, end, hasNext := paginate(len(filtered), page, perPage)
-	views := make([]issueJSON, 0, end-start)
-	for _, it := range filtered[start:end] {
-		views = append(views, s.issueView(r, it))
-	}
-	resp := jsonResponse(200, mustJSON(views))
-	if hasNext {
-		resp.headers = map[string]string{"Link": q.linkNext(page+1, perPage)}
-	}
-	return resp
-}
-
-func (s *server) handleComments(q *request, owner, name string, number int) response {
+func (s *server) issueCollection(q *request, key repoRoute) response {
 	switch q.method {
 	case "GET":
-		s.st.mu.RLock()
-		defer s.st.mu.RUnlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
-		it := r.issuesByNum[number]
-		if it == nil {
-			return jsonError(404, "Not Found")
-		}
-		views := []commentJSON{}
-		for _, c := range it.comments {
-			views = append(views, commentJSON{ID: c.id, Body: c.body, User: s.viewerJSON(), CreatedAt: fixedTime, UpdatedAt: fixedTime})
-		}
-		return jsonResponse(200, mustJSON(views))
+		return s.withRepo(key, false, func(r *repository) response {
+			state, direction := restState(q), q.queryValue("direction")
+			issues := selectInOrder(r.issues, direction == "" || direction == "desc", func(it *issue) bool {
+				return state == "all" || it.state == state
+			})
+			return restPage(q, issues, func(it *issue) issueJSON { return s.issueView(r, it) })
+		})
 	case "POST":
 		body, ok := parseBody(q)
 		if !ok {
-			return jsonError(400, "Problems parsing JSON")
+			return restBadJSON()
 		}
+		title, _ := strField(body, "title")
+		if title == "" {
+			return jsonError(422, "title is required")
+		}
+		labels := strListField(body, "labels")
 		text, _ := strField(body, "body")
-		s.st.mu.Lock()
-		defer s.st.mu.Unlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
+		return s.withRepo(key, true, func(r *repository) response {
+			if missing, invalid := r.unknownLabel(labels); invalid {
+				return missingLabel(missing)
+			}
+			return restJSON(201, s.issueView(r, s.st.createIssue(r, title, text, labels)))
+		})
+	}
+	return restNotFound()
+}
+
+func restState(q *request) string {
+	if state := q.queryValue("state"); state != "" {
+		return state
+	}
+	return "open"
+}
+
+func missingLabel(label string) response { return jsonError(422, "the label "+label+" does not exist") }
+
+func applyIssuePatch(r *repository, it *issue, body map[string]any) (string, bool) {
+	if title, ok := strField(body, "title"); ok {
+		it.title = title
+	}
+	if text, ok := strField(body, "body"); ok {
+		it.body = text
+	}
+	state, _ := strField(body, "state")
+	switch lower := strings.ToLower(state); lower {
+	case "open", "closed":
+		it.state = lower
+	}
+	// Label validation comes last: the existing API applies textual changes
+	// even when the label replacement is rejected.
+	if _, replacingLabels := body["labels"]; replacingLabels {
+		labels := strListField(body, "labels")
+		if name, invalid := r.unknownLabel(labels); invalid {
+			return name, true
 		}
+		it.labels = labels
+	}
+	return "", false
+}
+
+func (s *server) withIssue(key repoRoute, number int, write bool, handler func(*repository, *issue) response) response {
+	return s.withRepo(key, write, func(r *repository) response {
 		it := r.issuesByNum[number]
 		if it == nil {
-			return jsonError(404, "Not Found")
+			return restNotFound()
 		}
-		c := s.st.addComment(r, it, text)
-		return jsonResponse(201, mustJSON(commentJSON{ID: c.id, Body: c.body, User: s.viewerJSON(), CreatedAt: fixedTime, UpdatedAt: fixedTime}))
+		return handler(r, it)
+	})
+}
+
+func (s *server) handleComments(q *request, key repoRoute, number int) response {
+	switch q.method {
+	case "GET":
+		return s.withIssue(key, number, false, func(_ *repository, it *issue) response {
+			views := make([]commentJSON, len(it.comments))
+			viewer := s.viewerJSON()
+			for i, c := range it.comments {
+				views[i] = commentView(viewer, c)
+			}
+			return restJSON(200, views)
+		})
+	case "POST":
+		body, ok := parseBody(q)
+		if !ok {
+			return restBadJSON()
+		}
+		text, _ := strField(body, "body")
+		return s.withIssue(key, number, true, func(r *repository, it *issue) response {
+			return restJSON(201, commentView(s.viewerJSON(), s.st.addComment(r, it, text)))
+		})
 	}
-	return jsonError(404, "Not Found")
+	return restNotFound()
+}
+
+func commentView(viewer userJSON, c *comment) commentJSON {
+	return commentJSON{ID: c.id, Body: c.body, User: viewer, CreatedAt: fixedTime, UpdatedAt: fixedTime}
 }
 
 // ---------------------------------------------------------------------------
 // Pull requests
 
 func (s *server) handlePulls(q *request, owner, name string, tail []string) response {
+	key := repoRoute{owner, name}
 	if len(tail) == 0 {
-		switch q.method {
-		case "GET":
-			s.st.mu.RLock()
-			defer s.st.mu.RUnlock()
-			r := s.lookupRepo(owner, name)
-			if r == nil {
-				return jsonError(404, "Not Found")
-			}
-			state := q.queryValue("state")
-			if state == "" {
-				state = "open"
-			}
-			var filtered []*pullRequest
-			for _, pr := range r.pulls {
-				if state != "all" && pr.state != state {
-					continue
-				}
-				filtered = append(filtered, pr)
-			}
-			// Newest first.
-			for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
-				filtered[i], filtered[j] = filtered[j], filtered[i]
-			}
-			page := q.queryInt("page", 1)
-			perPage := q.queryInt("per_page", 30)
-			start, end, hasNext := paginate(len(filtered), page, perPage)
-			views := make([]pullJSON, 0, end-start)
-			for _, pr := range filtered[start:end] {
-				views = append(views, s.pullView(r, pr))
-			}
-			resp := jsonResponse(200, mustJSON(views))
-			if hasNext {
-				resp.headers = map[string]string{"Link": q.linkNext(page+1, perPage)}
-			}
-			return resp
-		case "POST":
-			body, ok := parseBody(q)
-			if !ok {
-				return jsonError(400, "Problems parsing JSON")
-			}
-			title, hasTitle := strField(body, "title")
-			head, hasHead := strField(body, "head")
-			base, hasBase := strField(body, "base")
-			if !hasTitle || title == "" || !hasHead || !hasBase {
-				return jsonError(422, "title, head and base are required")
-			}
-			bodyText, _ := strField(body, "body")
-			head = stripOwnerPrefix(head)
-			base = stripOwnerPrefix(base)
-			s.st.mu.Lock()
-			defer s.st.mu.Unlock()
-			r := s.lookupRepo(owner, name)
-			if r == nil {
-				return jsonError(404, "Not Found")
-			}
-			headSha, okHead := r.refs["refs/heads/"+head]
-			baseSha, okBase := r.refs["refs/heads/"+base]
-			if !okHead {
-				return jsonError(422, "the head branch does not exist")
-			}
-			if !okBase {
-				return jsonError(422, "the base branch does not exist")
-			}
-			pr := s.st.createPull(r, title, bodyText, head, base, headSha, baseSha)
-			return jsonResponse(201, mustJSON(s.pullView(r, pr)))
-		}
-		return jsonError(404, "Not Found")
+		return s.pullCollection(q, key)
 	}
 	number, err := strconv.Atoi(tail[0])
 	if err != nil {
-		return jsonError(404, "Not Found")
+		return restNotFound()
 	}
-	if len(tail) == 2 && tail[1] == "files" {
-		if q.method != "GET" {
-			return jsonError(404, "Not Found")
+	switch {
+	case q.method == "GET" && len(tail) == 1:
+		return s.withPull(key, number, false, func(r *repository, pr *pullRequest) response {
+			return restJSON(200, s.pullView(r, pr))
+		})
+	case q.method == "GET" && len(tail) == 2 && tail[1] == "files":
+		return s.withPull(key, number, false, func(r *repository, pr *pullRequest) response {
+			return restJSON(200, s.pullFilesView(r, pr))
+		})
+	case q.method == "PUT" && len(tail) == 2 && tail[1] == "merge":
+		if _, ok := parseBody(q); !ok {
+			return restBadJSON()
 		}
-		s.st.mu.RLock()
-		defer s.st.mu.RUnlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
+		return s.withPull(key, number, true, s.mergePullResponse)
+	}
+	return restNotFound()
+}
+
+func (s *server) withPull(key repoRoute, number int, write bool, handler func(*repository, *pullRequest) response) response {
+	return s.withRepo(key, write, func(r *repository) response {
 		pr := r.pullsByNum[number]
 		if pr == nil {
-			return jsonError(404, "Not Found")
+			return restNotFound()
 		}
-		return jsonResponse(200, mustJSON(s.pullFilesView(r, pr)))
-	}
-	if len(tail) == 2 && tail[1] == "merge" {
-		if q.method != "PUT" {
-			return jsonError(404, "Not Found")
-		}
-		if len(q.body) > 0 {
-			if _, ok := parseBody(q); !ok {
-				return jsonError(400, "Problems parsing JSON")
-			}
-		}
-		s.st.mu.Lock()
-		defer s.st.mu.Unlock()
-		r := s.lookupRepo(owner, name)
-		if r == nil {
-			return jsonError(404, "Not Found")
-		}
-		pr := r.pullsByNum[number]
-		if pr == nil {
-			return jsonError(404, "Not Found")
-		}
-		sha, conflict, already := s.mergePullRequest(r, pr)
-		if already {
-			return jsonError(405, "Pull request is already merged")
-		}
-		if conflict {
-			return jsonError(405, "Merge conflict")
-		}
-		return jsonResponse(200, mustJSON(map[string]any{
+		return handler(r, pr)
+	})
+}
+
+func (s *server) mergePullResponse(r *repository, pr *pullRequest) response {
+	sha, conflict, already := s.mergePullRequest(r, pr)
+	switch {
+	case already:
+		return jsonError(405, "Pull request is already merged")
+	case conflict:
+		return jsonError(405, "Merge conflict")
+	default:
+		return restJSON(200, map[string]any{
 			"sha": sha.String(), "merged": true, "message": "Pull request successfully merged",
-		}))
+		})
 	}
-	if len(tail) != 1 || q.method != "GET" {
-		return jsonError(404, "Not Found")
+}
+
+func (s *server) pullCollection(q *request, key repoRoute) response {
+	switch q.method {
+	case "GET":
+		return s.withRepo(key, false, func(r *repository) response {
+			state := restState(q)
+			pulls := selectInOrder(r.pulls, true, func(pr *pullRequest) bool {
+				return state == "all" || pr.state == state
+			})
+			return restPage(q, pulls, func(pr *pullRequest) pullJSON { return s.pullView(r, pr) })
+		})
+	case "POST":
+		return s.openPull(q, key)
 	}
-	s.st.mu.RLock()
-	defer s.st.mu.RUnlock()
-	r := s.lookupRepo(owner, name)
-	if r == nil {
-		return jsonError(404, "Not Found")
+	return restNotFound()
+}
+
+func (s *server) openPull(q *request, key repoRoute) response {
+	body, ok := parseBody(q)
+	if !ok {
+		return restBadJSON()
 	}
-	pr := r.pullsByNum[number]
-	if pr == nil {
-		return jsonError(404, "Not Found")
+	title, _ := strField(body, "title")
+	headName, hasHead := strField(body, "head")
+	baseName, hasBase := strField(body, "base")
+	if title == "" || !hasHead || !hasBase {
+		return jsonError(422, "title, head and base are required")
 	}
-	return jsonResponse(200, mustJSON(s.pullView(r, pr)))
+	head, base := stripOwnerPrefix(headName), stripOwnerPrefix(baseName)
+	text, _ := strField(body, "body")
+	return s.withRepo(key, true, func(r *repository) response {
+		headTip, ok := r.refs[branchRef(head)]
+		if !ok {
+			return jsonError(422, "the head branch does not exist")
+		}
+		baseTip, ok := r.refs[branchRef(base)]
+		if !ok {
+			return jsonError(422, "the base branch does not exist")
+		}
+		pr := s.st.createPull(r, title, text, head, base, headTip, baseTip)
+		return restJSON(201, s.pullView(r, pr))
+	})
 }
 
 // stripOwnerPrefix turns "owner:branch" into "branch".
@@ -1414,17 +1264,9 @@ type pullFileJSON struct {
 
 // pullFilesView diffs the merge-base tree against the head tip's tree.
 func (s *server) pullFilesView(r *repository, pr *pullRequest) []pullFileJSON {
-	headTip := r.refs["refs/heads/"+pr.headRef]
-	baseTip := r.refs["refs/heads/"+pr.baseRef]
-	base := r.mergeBase(baseTip, headTip)
-	var baseTree, headTree Oid
-	if c := r.commitOf(base); c != nil {
-		baseTree = c.tree
-	}
-	if c := r.commitOf(headTip); c != nil {
-		headTree = c.tree
-	}
-	changes := r.diffTrees(baseTree, headTree)
+	headTip := r.refs[branchRef(pr.headRef)]
+	baseTip := r.refs[branchRef(pr.baseRef)]
+	changes := r.diffTrees(r.commitTree(r.mergeBase(baseTip, headTip)), r.commitTree(headTip))
 	views := make([]pullFileJSON, 0, len(changes))
 	for _, ch := range changes {
 		sha := ""
@@ -1446,28 +1288,15 @@ func (s *server) mergePullRequest(r *repository, pr *pullRequest) (Oid, bool, bo
 	if pr.state != "open" {
 		return ZeroOid, false, true
 	}
-	baseTip := r.refs["refs/heads/"+pr.baseRef]
-	headTip := r.refs["refs/heads/"+pr.headRef]
-	base := r.mergeBase(baseTip, headTip)
-	var baseTree, oursTree, theirsTree Oid
-	if c := r.commitOf(base); c != nil {
-		baseTree = c.tree
-	}
-	if c := r.commitOf(baseTip); c != nil {
-		oursTree = c.tree
-	}
-	if c := r.commitOf(headTip); c != nil {
-		theirsTree = c.tree
-	}
-	merged, ok := r.mergeTrees(r.flattenTree(baseTree), r.flattenTree(oursTree), r.flattenTree(theirsTree))
+	baseRef := branchRef(pr.baseRef)
+	baseTip := r.refs[baseRef]
+	headTip := r.refs[branchRef(pr.headRef)]
+	merged, ok := r.mergeCommits(baseTip, headTip)
 	if !ok {
 		return ZeroOid, true, false
 	}
-	newTree := r.treeFromFlat(merged)
-	ts := s.st.nextTime()
-	identity := s.st.viewerName + " <" + s.st.viewerEmail + ">"
-	mergeSha := r.buildCommitObject(newTree, []Oid{baseTip}, pr.title, identity, identity, ts)
-	r.refs["refs/heads/"+pr.baseRef] = mergeSha
+	mergeSha, ts := s.st.commitAsViewer(r, r.treeFromFlat(merged), []Oid{baseTip}, pr.title)
+	r.refs[baseRef] = mergeSha
 	pr.state = "closed"
 	pr.merged = true
 	pr.mergedAt = formatTime(ts)

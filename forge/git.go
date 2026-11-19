@@ -8,10 +8,94 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
+
+type gitRoute uint8
+
+const (
+	gitNoRoute gitRoute = iota
+	gitInfoRefs
+	gitUpload
+	gitReceive
+)
+
+const (
+	uploadService  = "git-upload-pack"
+	receiveService = "git-receive-pack"
+)
+
+func matchGitRoute(segments []string) (repoRoute, gitRoute) {
+	if len(segments) < 3 {
+		return repoRoute{}, gitNoRoute
+	}
+	repo, eligible := strings.CutSuffix(segments[1], ".git")
+	if !eligible {
+		return repoRoute{}, gitNoRoute
+	}
+	key := repoRoute{owner: segments[0], name: repo}
+	switch {
+	case len(segments) == 4 && segments[2] == "info" && segments[3] == "refs":
+		return key, gitInfoRefs
+	case len(segments) == 3 && segments[2] == uploadService:
+		return key, gitUpload
+	case len(segments) == 3 && segments[2] == receiveService:
+		return key, gitReceive
+	}
+	return repoRoute{}, gitNoRoute
+}
+
+func (s *server) routeGit(q *request) (response, bool) {
+	key, route := matchGitRoute(q.segments())
+	if route == gitNoRoute {
+		return response{}, false
+	}
+	if !s.authorized(q) {
+		return jsonError(401, "Requires authentication"), true
+	}
+	if route == gitInfoRefs {
+		if q.method != "GET" {
+			return restNotFound(), true
+		}
+		service := q.queryValue("service")
+		v2 := q.headers.values[protocolHeader] == "version=2"
+		return s.withRepo(key, false, func(r *repository) response {
+			return r.gitAdvertisement(service, v2)
+		}), true
+	}
+	if q.method != "POST" {
+		return restNotFound(), true
+	}
+	return s.withRepo(key, route == gitReceive, func(r *repository) response {
+		serve := handleUploadPackPOST
+		if route == gitReceive {
+			serve = handleReceivePackPOST
+		}
+		body, contentType, status := serve(r, q.body)
+		return response{status: status, contentType: contentType, body: body}
+	}), true
+}
+
+var uploadAdvertisementV2 = advertiseV2(uploadService)
+
+func (r *repository) gitAdvertisement(service string, v2 bool) response {
+	var body []byte
+	switch service {
+	case uploadService:
+		if v2 {
+			body = uploadAdvertisementV2
+		} else {
+			body = advertiseV0(r, service, uploadPackCapsV0)
+		}
+	case receiveService:
+		body = advertiseV0(r, service, receivePackCapsV0)
+	default:
+		return jsonError(400, "unknown service")
+	}
+	return response{status: 200, contentType: "application/x-" + service + "-advertisement", body: body}
+}
 
 // ---------------------------------------------------------------------------
 // pkt-line framing
@@ -39,11 +123,8 @@ func appendPktLen(out []byte, n int) []byte {
 		hexdigits[total&0xf])
 }
 
-// pktLine frames one payload (which should end with "\n" for text lines).
-func pktLine(payload string) []byte {
-	out := make([]byte, 0, len(payload)+4)
-	out = appendPktLen(out, len(payload))
-	return append(out, payload...)
+func appendPktText(dst []byte, payload string) []byte {
+	return append(appendPktLen(dst, len(payload)), payload...)
 }
 
 // parsePktLen parses a 4-byte hex pkt-line length without allocating. A
@@ -73,9 +154,6 @@ func parsePktLen(hdr []byte) (int, bool) {
 	return n, true
 }
 
-func pktFlushBytes() []byte { return []byte(pktFlush) }
-func pktDelimBytes() []byte { return []byte(pktDelim) }
-
 // pktPacket is one decoded packet: a flush, a delim, a response-end, or data.
 type pktPacket struct {
 	kind    byte // 'f' flush, 'd' delim, 'e' end, 'D' data
@@ -86,35 +164,38 @@ type pktPacket struct {
 // complete packet stop the parse; the caller decides whether that is an error.
 func decodePktLines(b []byte) ([]pktPacket, int, error) {
 	var out []pktPacket
-	off := 0
-	for off+4 <= len(b) {
-		hdr := b[off : off+4]
-		if string(hdr) == pktFlush {
-			out = append(out, pktPacket{kind: 'f'})
-			off += 4
-			continue
+	offset := 0
+	for len(b)-offset >= 4 {
+		packet, consumed, err := readPacket(b[offset:])
+		if err != nil {
+			return out, offset, err
 		}
-		if string(hdr) == pktDelim {
-			out = append(out, pktPacket{kind: 'd'})
-			off += 4
-			continue
-		}
-		if string(hdr) == pktEnd {
-			out = append(out, pktPacket{kind: 'e'})
-			off += 4
-			continue
-		}
-		n, ok := parsePktLen(hdr)
-		if !ok || n < 4 {
-			return out, off, fmt.Errorf("bad pkt-line length %q", string(hdr))
-		}
-		if off+int(n) > len(b) {
-			return out, off, fmt.Errorf("pkt-line of %d bytes overruns the stream", n)
-		}
-		out = append(out, pktPacket{kind: 'D', payload: b[off+4 : off+int(n)]})
-		off += int(n)
+		out = append(out, packet)
+		offset += consumed
 	}
-	return out, off, nil
+	return out, offset, nil
+}
+
+// readPacket requires a complete four-byte header. Keeping the boundary
+// calculation here also lets receive-pack switch to raw pack bytes at flush.
+func readPacket(input []byte) (pktPacket, int, error) {
+	header := input[:4]
+	switch string(header) {
+	case pktFlush:
+		return pktPacket{kind: 'f'}, 4, nil
+	case pktDelim:
+		return pktPacket{kind: 'd'}, 4, nil
+	case pktEnd:
+		return pktPacket{kind: 'e'}, 4, nil
+	}
+	length, valid := parsePktLen(header)
+	if !valid || length < 4 {
+		return pktPacket{}, 0, fmt.Errorf("bad pkt-line length %q", string(header))
+	}
+	if length > len(input) {
+		return pktPacket{}, 0, fmt.Errorf("pkt-line of %d bytes overruns the stream", length)
+	}
+	return pktPacket{kind: 'D', payload: input[4:length]}, length, nil
 }
 
 // decodePktLinesAll parses a whole stream; any leftover bytes are an error.
@@ -143,30 +224,21 @@ func pktLinesText(packets []pktPacket) []string {
 // ---------------------------------------------------------------------------
 // Sideband framing
 
-// sidebandWrap splits data into sideband packets on the given band, each
-// packet at most 65520 bytes total.
-func sidebandWrap(band byte, data []byte) []byte {
-	var out []byte
-	const maxData = 65520 - 4 - 1
-	for len(data) > 0 {
-		n := len(data)
-		if n > maxData {
-			n = maxData
-		}
-		chunk := data[:n]
+// appendSideband frames at most 65515 payload bytes in each packet.
+func appendSideband(dst []byte, band byte, data []byte) []byte {
+	const maxData = 65515
+	frames := max(1, (len(data)+maxData-1)/maxData)
+	dst = slices.Grow(dst, len(data)+5*frames)
+	for {
+		n := min(len(data), maxData)
+		dst = appendPktLen(dst, n+1)
+		dst = append(dst, band)
+		dst = append(dst, data[:n]...)
 		data = data[n:]
-		pkt := make([]byte, 0, n+5)
-		pkt = appendPktLen(pkt, n+1)
-		pkt = append(pkt, band)
-		pkt = append(pkt, chunk...)
-		out = append(out, pkt...)
+		if len(data) == 0 {
+			return dst
+		}
 	}
-	if len(out) == 0 {
-		// Even an empty payload gets one sideband packet.
-		out = append(out, []byte("0005")...)
-		out = append(out, band)
-	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -180,51 +252,52 @@ const receivePackCapsV0 = "report-status side-band-64k delete-refs ofs-delta " +
 
 // advertiseV0 writes a v0 ref advertisement for a service.
 func advertiseV0(r *repository, service string, caps string) []byte {
-	var out []byte
-	out = append(out, pktLine("# service="+service+"\n")...)
-	out = append(out, pktFlushBytes()...)
+	out := serviceIntro(service)
 	names := r.refNames()
 	if len(names) == 0 {
-		out = append(out, pktLine(ZeroOid.String()+" capabilities^{}\x00"+caps+"\n")...)
-		return out
+		return appendRefPacket(out, ZeroOid, "capabilities^{}", "\x00"+caps)
 	}
-	headOid := r.refs[headRef]
-	first := true
-	emit := func(oid Oid, name string) {
-		line := oid.String() + " " + name
-		if first {
-			line += "\x00" + caps
-			first = false
-		}
-		out = append(out, pktLine(line+"\n")...)
-	}
-	emit(headOid, "HEAD")
+	out = appendRefPacket(out, r.refs[headRef], "HEAD", "\x00"+caps)
 	for _, name := range names {
-		emit(r.refs[name], name)
+		out = appendRefPacket(out, r.refs[name], name, "")
 	}
-	// Peeled lines for annotated tags.
 	for _, name := range names {
-		oid := r.refs[name]
-		if o := r.objects[oid]; o != nil && o.typ == objTag {
-			peeled := r.peelTarget(oid)
-			out = append(out, pktLine(peeled.String()+" "+name+"^{}\n")...)
+		if target, tagged := r.advertisedTarget(r.refs[name]); tagged {
+			out = appendRefPacket(out, target, name, "^{}")
 		}
 	}
 	return out
 }
 
+func (r *repository) advertisedTarget(oid Oid) (Oid, bool) {
+	if obj := r.objects[oid]; obj != nil && obj.typ == objTag {
+		return r.peelTarget(oid), true
+	}
+	return ZeroOid, false
+}
+
+func appendRefPacket(dst []byte, oid Oid, name, attrs string) []byte {
+	dst = appendPktLen(dst, 2*len(oid)+1+len(name)+len(attrs)+1)
+	dst = oid.appendHex(dst)
+	dst = append(dst, ' ')
+	dst = append(dst, name...)
+	dst = append(dst, attrs...)
+	return append(dst, '\n')
+}
+
+func serviceIntro(service string) []byte {
+	return append(appendPktText(nil, "# service="+service+"\n"), pktFlush...)
+}
+
 // advertiseV2 writes the protocol v2 capability advertisement.
 func advertiseV2(service string) []byte {
-	var out []byte
-	out = append(out, pktLine("# service="+service+"\n")...)
-	out = append(out, pktFlushBytes()...)
-	out = append(out, pktLine("version 2\n")...)
-	out = append(out, pktLine("fetch=shallow\n")...)
-	out = append(out, pktLine("ls-refs=unborn\n")...)
-	out = append(out, pktLine("object-format=sha1\n")...)
-	out = append(out, pktLine(agentCap+"\n")...)
-	out = append(out, pktFlushBytes()...)
-	return out
+	out := serviceIntro(service)
+	for _, capability := range [...]string{
+		"version 2", "fetch=shallow", "ls-refs=unborn", "object-format=sha1", agentCap,
+	} {
+		out = appendPktText(out, capability+"\n")
+	}
+	return append(out, pktFlush...)
 }
 
 // ---------------------------------------------------------------------------
@@ -255,31 +328,27 @@ func handleLsRefs(r *repository, args *lsRefsArgs) []byte {
 	names := r.refNames()
 	if len(names) == 0 {
 		if args.unborn {
-			out = append(out, pktLine("unborn HEAD symref-target:"+headRef+"\n")...)
+			out = appendPktText(out, "unborn HEAD symref-target:"+headRef+"\n")
 		}
-		out = append(out, pktFlushBytes()...)
-		return out
+		return append(out, pktFlush...)
 	}
-	if args.symrefs {
-		if headOid, ok := r.refs[headRef]; ok && args.matches("HEAD") {
-			out = append(out, pktLine(headOid.String()+" HEAD symref-target:"+headRef+"\n")...)
-		}
+	if oid, present := r.refs[headRef]; present && args.symrefs && args.matches("HEAD") {
+		out = appendRefPacket(out, oid, "HEAD", " symref-target:"+headRef)
 	}
 	for _, name := range names {
 		if !args.matches(name) {
 			continue
 		}
 		oid := r.refs[name]
-		line := oid.String() + " " + name
+		var attrs string
 		if args.peel {
-			if o := r.objects[oid]; o != nil && o.typ == objTag {
-				line += " peeled:" + r.peelTarget(oid).String()
+			if target, tagged := r.advertisedTarget(oid); tagged {
+				attrs = " peeled:" + target.String()
 			}
 		}
-		out = append(out, pktLine(line+"\n")...)
+		out = appendRefPacket(out, oid, name, attrs)
 	}
-	out = append(out, pktFlushBytes()...)
-	return out
+	return append(out, pktFlush...)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,159 +361,151 @@ type fetchRequest struct {
 	deepen  int   // 0 means no depth limit
 }
 
-// fetchSelection computes the objects to send, the new shallow boundaries and
-// the boundaries that cease to be shallow.
-//
-//   - held is the closure of the haves, stopping at the client's shallow
-//     boundaries: their parents are not held.
-//   - the send walk starts at the wants and stops at held commits, except that
-//     it walks through shallow boundaries (their parents are not held).
-//   - with a depth limit D, commits at distance < D are sent with their full
-//     tree closure; commits at distance D-1 that have parents become shallow
-//     boundaries.
-func (r *repository) fetchSelection(req *fetchRequest) (send map[Oid]bool, shallowOut, unshallow []Oid) {
-	shallowSet := map[Oid]bool{}
-	for _, s := range req.shallow {
-		shallowSet[s] = true
-	}
-	// The held set: walk from the haves, not crossing shallow boundaries.
-	held := map[Oid]bool{}
-	{
-		stack := append([]Oid(nil), req.haves...)
-		for len(stack) > 0 {
-			cur := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-			if held[cur] {
-				continue
-			}
-			held[cur] = true
-			if shallowSet[cur] {
-				continue
-			}
-			if c := r.commitOf(cur); c != nil {
-				stack = append(stack, c.parents...)
-			}
-		}
-	}
-	// The held objects: every held commit plus its tree and blob closure.
-	// A shared blob or subtree must never be re-sent to a client that holds
-	// it through an older tip.
-	heldObjects := map[Oid]bool{}
-	for oid := range held {
-		heldObjects[oid] = true
-		if c := r.commitOf(oid); c != nil {
-			r.collectTreeObjects(c.tree, heldObjects)
-		}
-	}
+type fetchObjectSet map[Oid]struct{}
 
-	send = map[Oid]bool{}
-	shallowMap := map[Oid]bool{}
-	type item struct {
-		oid   Oid
-		depth int
+// add reports whether this is the first visit to the object.
+func (set fetchObjectSet) add(oid Oid) bool {
+	if set.has(oid) {
+		return false
 	}
-	visited := map[Oid]bool{}
-	queue := []item{}
-	for _, w := range req.wants {
-		queue = append(queue, item{oid: w, depth: 0})
+	set[oid] = struct{}{}
+	return true
+}
+
+func (set fetchObjectSet) has(oid Oid) bool {
+	_, exists := set[oid]
+	return exists
+}
+
+type fetchPlan struct {
+	objects   fetchObjectSet
+	shallow   []Oid
+	unshallow []Oid
+}
+
+type fetchVisit struct {
+	oid   Oid
+	depth int
+}
+
+func (r *repository) planFetch(req *fetchRequest) fetchPlan {
+	boundary := make(fetchObjectSet, len(req.shallow))
+	for _, oid := range req.shallow {
+		boundary.add(oid)
 	}
-	for len(queue) > 0 {
-		cur := queue[0]
+	held, heldTrees := r.fetchHaves(req.haves, boundary)
+	plan := fetchPlan{objects: make(fetchObjectSet)}
+	visited := make(fetchObjectSet)
+	queue := make([]fetchVisit, 0, len(req.wants))
+	for _, oid := range req.wants {
+		queue = append(queue, fetchVisit{oid: oid})
+	}
+	for len(queue) != 0 {
+		visit := queue[0]
 		queue = queue[1:]
-		if visited[cur.oid] {
+		if !visited.add(visit.oid) {
 			continue
 		}
-		visited[cur.oid] = true
-		o := r.objects[cur.oid]
-		if o == nil {
+		object := r.objects[visit.oid]
+		if object == nil {
 			continue
 		}
-		// A tag want contributes the tag object and walks its target.
-		if o.typ == objTag {
-			if !held[cur.oid] {
-				send[cur.oid] = true
+		if object.typ != objCommit {
+			if !held.has(visit.oid) {
+				// A direct non-commit want contributes the requested object.
+				plan.objects.add(visit.oid)
 			}
-			target := r.peelTarget(cur.oid)
-			if target != cur.oid {
-				queue = append(queue, item{oid: target, depth: cur.depth})
-			}
-			continue
-		}
-		if o.typ != objCommit {
-			// A tree or blob want: send it (and a tree's closure).
-			if !held[cur.oid] {
-				send[cur.oid] = true
-				if o.typ == objTree {
-					r.collectTreeObjects(cur.oid, send)
+			if object.typ == objTag {
+				if target := r.peelTarget(visit.oid); target != visit.oid {
+					queue = append(queue, fetchVisit{oid: target, depth: visit.depth})
 				}
 			}
 			continue
 		}
-		if held[cur.oid] && !shallowSet[cur.oid] {
+		if held.has(visit.oid) && !boundary.has(visit.oid) {
 			continue
 		}
-		if req.deepen > 0 && cur.depth >= req.deepen {
+		commit := object.commit
+		if commit == nil || req.deepen > 0 && visit.depth >= req.deepen {
 			continue
 		}
-		c := o.commit
-		if c == nil {
-			continue
+		if !held.has(visit.oid) {
+			plan.objects.add(visit.oid)
+			r.addFetchTree(commit.tree, plan.objects)
 		}
-		if !held[cur.oid] {
-			send[cur.oid] = true
-			r.collectTreeObjects(c.tree, send)
+		if len(commit.parents) != 0 && visit.depth+1 == req.deepen {
+			plan.shallow = append(plan.shallow, visit.oid)
 		}
-		if req.deepen > 0 && cur.depth == req.deepen-1 && len(c.parents) > 0 {
-			shallowMap[cur.oid] = true
-		}
-		for _, p := range c.parents {
-			queue = append(queue, item{oid: p, depth: cur.depth + 1})
+		for _, parent := range commit.parents {
+			queue = append(queue, fetchVisit{oid: parent, depth: visit.depth + 1})
 		}
 	}
-
-	// Nothing the client already holds goes out, even when a new commit's
-	// tree shares objects with an older tip's tree.
-	for oid := range heldObjects {
-		delete(send, oid)
+	for oid := range heldTrees {
+		delete(plan.objects, oid)
 	}
-
-	// Unshallow: an old boundary whose parents are all in send or held.
-	for _, s := range req.shallow {
-		c := r.commitOf(s)
-		if c == nil {
-			continue
-		}
-		all := true
-		for _, p := range c.parents {
-			if !send[p] && !held[p] {
-				all = false
-				break
-			}
-		}
-		if all {
-			unshallow = append(unshallow, s)
+	for _, oid := range req.shallow {
+		if c := r.commitOf(oid); c != nil && allParentsAvailable(c.parents, held, plan.objects) {
+			plan.unshallow = append(plan.unshallow, oid)
 		}
 	}
-	for oid := range shallowMap {
-		shallowOut = append(shallowOut, oid)
-	}
-	sort.Slice(shallowOut, func(i, j int) bool { return bytes.Compare(shallowOut[i][:], shallowOut[j][:]) < 0 })
-	sort.Slice(unshallow, func(i, j int) bool { return bytes.Compare(unshallow[i][:], unshallow[j][:]) < 0 })
-	return send, shallowOut, unshallow
+	slices.SortFunc(plan.shallow, compareOids)
+	slices.SortFunc(plan.unshallow, compareOids)
+	return plan
 }
 
-// collectTreeObjects adds a tree and everything under it to the set.
-func (r *repository) collectTreeObjects(treeOid Oid, set map[Oid]bool) {
-	o := r.objects[treeOid]
-	if o == nil || o.typ != objTree || set[treeOid] {
+func compareOids(a, b Oid) int { return bytes.Compare(a[:], b[:]) }
+
+func allParentsAvailable(parents []Oid, held, sending fetchObjectSet) bool {
+	for _, oid := range parents {
+		if !held.has(oid) && !sending.has(oid) {
+			return false
+		}
+	}
+	return true
+}
+
+// fetchHaves keeps ancestry distinct from the full set of held objects. A
+// shallow commit's tree is held even when none of its parents are held.
+func (r *repository) fetchHaves(haves []Oid, boundary fetchObjectSet) (fetchObjectSet, fetchObjectSet) {
+	if len(haves) == 0 {
+		return nil, nil
+	}
+	held := make(fetchObjectSet, len(haves))
+	stack := slices.Clone(haves)
+	for len(stack) != 0 {
+		last := len(stack) - 1
+		oid := stack[last]
+		stack = stack[:last]
+		if held.add(oid) && !boundary.has(oid) {
+			if commit := r.commitOf(oid); commit != nil {
+				stack = append(stack, commit.parents...)
+			}
+		}
+	}
+	objects := make(fetchObjectSet, len(held))
+	for oid := range held {
+		if commit := r.commitOf(oid); commit != nil {
+			r.addFetchTree(commit.tree, objects)
+		}
+	}
+	// Add held roots after tree traversal, so a tree listed explicitly in a
+	// have cannot suppress its own children based on map iteration order.
+	for oid := range held {
+		objects.add(oid)
+	}
+	return held, objects
+}
+
+func (r *repository) addFetchTree(root Oid, objects fetchObjectSet) {
+	tree := r.objects[root]
+	if tree == nil || tree.typ != objTree || !objects.add(root) {
 		return
 	}
-	set[treeOid] = true
-	for _, e := range o.tree {
-		if e.isDir() {
-			r.collectTreeObjects(e.oid, set)
+	for _, entry := range tree.tree {
+		if entry.isDir() {
+			r.addFetchTree(entry.oid, objects)
 		} else {
-			set[e.oid] = true
+			objects.add(entry.oid)
 		}
 	}
 }
@@ -454,53 +515,48 @@ func (r *repository) collectTreeObjects(treeOid Oid, set map[Oid]bool) {
 
 // fetchResponseV2 builds the protocol v2 fetch answer.
 func (r *repository) fetchResponseV2(req *fetchRequest) []byte {
-	send, shallowOut, unshallow := r.fetchSelection(req)
-	var out []byte
-	out = append(out, pktLine("acknowledgments\n")...)
-	out = append(out, pktLine("NAK\n")...)
-	out = append(out, pktFlushBytes()...)
-	if len(shallowOut) > 0 || len(unshallow) > 0 {
-		out = append(out, pktLine("shallow-info\n")...)
-		for _, s := range shallowOut {
-			out = append(out, pktLine("shallow "+s.String()+"\n")...)
+	if req.deepen == 1 && len(req.wants) == 1 && len(req.haves) == 0 && len(req.shallow) == 0 {
+		tip := req.wants[0]
+		if o := r.objects[tip]; o != nil && o.typ == objCommit {
+			return r.clones.get(tip, func() []byte { return r.renderFetch(r.planFetch(req), true) })
 		}
-		for _, s := range unshallow {
-			out = append(out, pktLine("unshallow "+s.String()+"\n")...)
-		}
-		out = append(out, pktFlushBytes()...)
 	}
-	out = append(out, pktLine("packfile\n")...)
-	pack := writePack(r.objectsSubset(send))
-	out = append(out, sidebandWrap(1, pack)...)
-	out = append(out, pktFlushBytes()...)
-	return out
+	return r.renderFetch(r.planFetch(req), true)
 }
 
-// fetchResponseV0 builds the protocol v0 fetch answer.
-func (r *repository) fetchResponseV0(req *fetchRequest) []byte {
-	send, shallowOut, unshallow := r.fetchSelection(req)
+func (r *repository) renderFetch(plan fetchPlan, version2 bool) []byte {
 	var out []byte
-	for _, s := range shallowOut {
-		out = append(out, pktLine("shallow "+s.String()+"\n")...)
-	}
-	for _, s := range unshallow {
-		out = append(out, pktLine("unshallow "+s.String()+"\n")...)
-	}
-	out = append(out, pktLine("NAK\n")...)
-	pack := writePack(r.objectsSubset(send))
-	out = append(out, sidebandWrap(1, pack)...)
-	out = append(out, pktFlushBytes()...)
-	return out
-}
-
-func (r *repository) objectsSubset(set map[Oid]bool) map[Oid]*gitObject {
-	out := make(map[Oid]*gitObject, len(set))
-	for oid := range set {
-		if o := r.objects[oid]; o != nil {
-			out[oid] = o
+	withBoundaries := len(plan.shallow)+len(plan.unshallow) != 0
+	if version2 {
+		out = appendPktText(out, "acknowledgments\n")
+		out = appendPktText(out, "NAK\n")
+		out = append(out, pktFlush...)
+		if withBoundaries {
+			out = appendPktText(out, "shallow-info\n")
 		}
 	}
-	return out
+	out = appendBoundaries(out, "shallow ", plan.shallow)
+	out = appendBoundaries(out, "unshallow ", plan.unshallow)
+	if version2 {
+		if withBoundaries {
+			out = append(out, pktFlush...)
+		}
+		out = appendPktText(out, "packfile\n")
+	} else {
+		out = appendPktText(out, "NAK\n")
+	}
+	pack := writeSelectedPack(r.objects, plan.objects)
+	return append(appendSideband(out, 1, pack), pktFlush...)
+}
+
+func appendBoundaries(dst []byte, prefix string, oids []Oid) []byte {
+	for _, oid := range oids {
+		dst = appendPktLen(dst, len(prefix)+2*len(oid)+1)
+		dst = append(dst, prefix...)
+		dst = oid.appendHex(dst)
+		dst = append(dst, '\n')
+	}
+	return dst
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +657,7 @@ func handleUploadPackPOST(r *repository, body []byte) ([]byte, string, int) {
 		}
 	}
 	parseFetchArgs(lines, req)
-	return r.fetchResponseV0(req), "application/x-git-upload-pack-result", 200
+	return r.renderFetch(r.planFetch(req), false), "application/x-git-upload-pack-result", 200
 }
 
 // ---------------------------------------------------------------------------
@@ -616,139 +672,119 @@ type pushCommand struct {
 // handleReceivePackPOST applies a push: commands, then a pack. It answers the
 // report-status stream (sideband band 1 when the client asked for it).
 func handleReceivePackPOST(r *repository, body []byte) ([]byte, string, int) {
-	// Parse the command list pkt by pkt, stopping at the flush: everything
-	// after it is the pack, which is not pkt-line framed.
-	var commands []pushCommand
-	sideband := false
-	sawFlush := false
-	off := 0
-	for off+4 <= len(body) {
-		hdr := body[off : off+4]
-		if string(hdr) == pktFlush {
-			off += 4
-			sawFlush = true
-			break
-		}
-		n, ok := parsePktLen(hdr)
-		if !ok || n < 4 || off+n > len(body) {
-			return []byte("bad pkt-line stream"), "text/plain", 400
-		}
-		raw := strings.TrimRight(string(body[off+4:off+int(n)]), "\n")
-		off += int(n)
-		line := raw
-		if i := strings.IndexByte(raw, 0); i >= 0 {
-			line = raw[:i]
-			caps := raw[i+1:]
-			if strings.Contains(caps, "side-band-64k") {
-				sideband = true
-			}
-		}
-		fields := strings.Fields(line)
-		if len(fields) != 3 {
-			return []byte("bad command line"), "text/plain", 400
-		}
-		oldOid, ok1 := parseOid(fields[0])
-		newOid, ok2 := parseOid(fields[1])
-		if !ok1 || !ok2 || !strings.HasPrefix(fields[2], "refs/") {
-			return []byte("bad command line"), "text/plain", 400
-		}
-		commands = append(commands, pushCommand{oldOid: oldOid, newOid: newOid, ref: fields[2]})
+	push, problem := parsePush(body)
+	if problem != "" {
+		return []byte(problem), "text/plain", 400
 	}
-	if !sawFlush || len(commands) == 0 {
-		return []byte("no command list"), "text/plain", 400
-	}
-	packBytes := body[off:]
+	return r.applyPush(push), "application/x-git-receive-pack-result", 200
+}
 
-	// Unpack first: objects land in the store even when a ref update is
-	// refused.
-	unpackOk := true
-	unpackDetail := "ok"
-	if len(packBytes) > 0 {
-		objects, err := parsePack(packBytes, func(oid Oid) *gitObject { return r.objects[oid] })
-		if err != nil {
-			unpackOk = false
-			unpackDetail = err.Error()
+type pushRequest struct {
+	commands []pushCommand
+	pack     []byte
+	sideband bool
+}
+
+func parsePush(input []byte) (pushRequest, string) {
+	var push pushRequest
+	for len(input) >= 4 {
+		packet, n, err := readPacket(input)
+		if err != nil || packet.kind != 'D' && packet.kind != 'f' {
+			return pushRequest{}, "bad pkt-line stream"
+		}
+		input = input[n:]
+		if packet.kind == 'f' {
+			if len(push.commands) == 0 {
+				break
+			}
+			push.pack = input
+			return push, ""
+		}
+		line, caps, _ := strings.Cut(strings.TrimRight(string(packet.payload), "\n"), "\x00")
+		command, valid := parsePushCommand(line)
+		if !valid {
+			return pushRequest{}, "bad command line"
+		}
+		push.sideband = push.sideband || strings.Contains(caps, "side-band-64k")
+		push.commands = append(push.commands, command)
+	}
+	return pushRequest{}, "no command list"
+}
+
+func parsePushCommand(line string) (pushCommand, bool) {
+	fields := strings.Fields(line)
+	if len(fields) != 3 || !strings.HasPrefix(fields[2], "refs/") {
+		return pushCommand{}, false
+	}
+	oldOid, oldOK := parseOid(fields[0])
+	newOid, newOK := parseOid(fields[1])
+	return pushCommand{oldOid: oldOid, newOid: newOid, ref: fields[2]}, oldOK && newOK
+}
+
+func (r *repository) applyPush(push pushRequest) []byte {
+	// Publish objects before considering refs. Ref failures are reported
+	// individually in command order and never roll back a successful unpack.
+	unpackErr := r.importPushPack(push.pack)
+	detail := "ok"
+	if unpackErr != nil {
+		detail = unpackErr.Error()
+	}
+	report := appendPktText(nil, "unpack "+detail+"\n")
+	for _, command := range push.commands {
+		reason := "unpack failed"
+		if unpackErr == nil {
+			reason = r.updatePushedRef(command)
+		}
+		if reason != "" {
+			report = appendPktText(report, "ng "+command.ref+" "+reason+"\n")
 		} else {
-			for _, o := range objects {
-				r.putObject(o.typ, o.data)
-			}
+			report = appendPktText(report, "ok "+command.ref+"\n")
 		}
 	}
+	report = append(report, pktFlush...)
+	if push.sideband {
+		report = appendSideband(nil, 1, report)
+	}
+	return append(report, pktFlush...)
+}
 
-	// Apply the ref updates in order.
-	type outcome struct {
-		ref    string
-		ok     bool
-		reason string
+func (r *repository) importPushPack(data []byte) error {
+	if len(data) == 0 {
+		return nil
 	}
-	outcomes := make([]outcome, 0, len(commands))
-	for _, cmd := range commands {
-		if !unpackOk {
-			outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "unpack failed"})
-			continue
-		}
-		current, exists := r.refs[cmd.ref]
-		switch {
-		case cmd.newOid.IsZero():
-			// Delete.
-			if !exists {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "remote ref does not exist"})
-			} else if !cmd.oldOid.IsZero() && current != cmd.oldOid {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "non-fast-forward"})
-			} else {
-				delete(r.refs, cmd.ref)
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: true})
-			}
-		case cmd.oldOid.IsZero():
-			// Create.
-			if exists {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "already exists"})
-			} else if r.objects[cmd.newOid] == nil {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "object not found"})
-			} else {
-				r.refs[cmd.ref] = cmd.newOid
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: true})
-			}
-		default:
-			// Update: the ref must be at old, and new must descend from old.
-			if !exists {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "remote ref does not exist"})
-			} else if current != cmd.oldOid {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "non-fast-forward"})
-			} else if r.objects[cmd.newOid] == nil {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "object not found"})
-			} else if !r.fastForward(cmd.oldOid, cmd.newOid) {
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: false, reason: "non-fast-forward"})
-			} else {
-				r.refs[cmd.ref] = cmd.newOid
-				outcomes = append(outcomes, outcome{ref: cmd.ref, ok: true})
-			}
-		}
+	objects, err := parsePack(data, r.object)
+	if err != nil {
+		return err
 	}
+	for _, obj := range objects {
+		r.putObject(obj.typ, obj.data)
+	}
+	return nil
+}
 
-	// The report-status stream, pkt-lined inside sideband band 1.
-	var inner []byte
-	if unpackOk {
-		inner = append(inner, pktLine("unpack ok\n")...)
-	} else {
-		inner = append(inner, pktLine("unpack "+unpackDetail+"\n")...)
+func (r *repository) updatePushedRef(cmd pushCommand) string {
+	current, exists := r.refs[cmd.ref]
+	creating := !cmd.newOid.IsZero() && cmd.oldOid.IsZero()
+	switch {
+	case creating && exists:
+		return "already exists"
+	case !creating && !exists:
+		return "remote ref does not exist"
+	case !cmd.oldOid.IsZero() && current != cmd.oldOid:
+		return "non-fast-forward"
 	}
-	for _, o := range outcomes {
-		if o.ok {
-			inner = append(inner, pktLine("ok "+o.ref+"\n")...)
-		} else {
-			inner = append(inner, pktLine("ng "+o.ref+" "+o.reason+"\n")...)
-		}
+	if cmd.newOid.IsZero() {
+		delete(r.refs, cmd.ref)
+		return ""
 	}
-	inner = append(inner, pktFlushBytes()...)
-	var out []byte
-	if sideband {
-		out = append(out, sidebandWrap(1, inner)...)
-	} else {
-		out = append(out, inner...)
+	if r.objects[cmd.newOid] == nil {
+		return "object not found"
 	}
-	out = append(out, pktFlushBytes()...)
-	return out, "application/x-git-receive-pack-result", 200
+	if !creating && !r.fastForward(cmd.oldOid, cmd.newOid) {
+		return "non-fast-forward"
+	}
+	r.refs[cmd.ref] = cmd.newOid
+	return ""
 }
 
 // fastForward answers whether newObj descends from oldObj (or is equal). Tag

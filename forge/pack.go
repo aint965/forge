@@ -13,7 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -345,13 +345,15 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 // ---------------------------------------------------------------------------
 // Pack generation
 
-// writePack serialises objects as a packfile with no deltas, in oid order.
-func writePack(objs map[Oid]*gitObject) []byte {
-	oids := make([]Oid, 0, len(objs))
-	for oid := range objs {
-		oids = append(oids, oid)
+// writeSelectedPack serializes only available objects, in deterministic oid order.
+func writeSelectedPack(objects map[Oid]*gitObject, selected fetchObjectSet) []byte {
+	oids := make([]Oid, 0, len(selected))
+	for oid := range selected {
+		if objects[oid] != nil {
+			oids = append(oids, oid)
+		}
 	}
-	sort.Slice(oids, func(i, j int) bool { return bytes.Compare(oids[i][:], oids[j][:]) < 0 })
+	slices.SortFunc(oids, compareOids)
 
 	var buf bytes.Buffer
 	buf.WriteString("PACK")
@@ -359,7 +361,7 @@ func writePack(objs map[Oid]*gitObject) []byte {
 	n := len(oids)
 	buf.Write([]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)})
 	for _, oid := range oids {
-		o := objs[oid]
+		o := objects[oid]
 		writePackEntry(&buf, o.typ, o.data)
 	}
 	sum := sha1.Sum(buf.Bytes())

@@ -11,12 +11,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"hash"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -34,20 +35,21 @@ var ZeroOid Oid
 
 func (o Oid) String() string { return hex.EncodeToString(o[:]) }
 
+func (o Oid) appendHex(dst []byte) []byte { return hex.AppendEncode(dst, o[:]) }
+
 func (o Oid) IsZero() bool { return o == ZeroOid }
 
 // parseOid decodes 40 lowercase or uppercase hex characters.
 func parseOid(s string) (Oid, bool) {
-	var o Oid
-	if len(s) != 40 {
-		return o, false
+	if len(s) != hex.EncodedLen(len(ZeroOid)) {
+		return ZeroOid, false
 	}
-	b, err := hex.DecodeString(s)
+	var oid Oid
+	_, err := hex.Decode(oid[:], []byte(s))
 	if err != nil {
-		return o, false
+		return ZeroOid, false
 	}
-	copy(o[:], b)
-	return o, true
+	return oid, true
 }
 
 const (
@@ -77,19 +79,15 @@ func typeName(t byte) string {
 func hashObjectId(typ byte, data []byte) Oid {
 	h := sha1Pool.Get().(hash.Hash)
 	h.Reset()
-	var hdr [32]byte
-	n := copy(hdr[:], typeName(typ))
-	hdr[n] = ' '
-	n++
-	n += len(strconv.AppendInt(hdr[n:n], int64(len(data)), 10))
-	hdr[n] = 0
-	n++
-	h.Write(hdr[:n])
+	var storage [32]byte
+	header := append(storage[:0], typeName(typ)...)
+	header = strconv.AppendInt(append(header, ' '), int64(len(data)), 10)
+	h.Write(append(header, 0))
 	h.Write(data)
-	var o Oid
-	copy(o[:], h.Sum(nil))
+	var oid Oid
+	h.Sum(oid[:0])
 	sha1Pool.Put(h)
-	return o
+	return oid
 }
 
 // ---------------------------------------------------------------------------
@@ -131,94 +129,95 @@ type gitObject struct {
 // message. A malformed object yields an empty commit rather than an error: the
 // object is still stored and hashed, it just carries no ancestry.
 func parseCommitHeader(data []byte) *parsedCommit {
-	c := &parsedCommit{}
-	rest := data
-	for len(rest) > 0 {
-		line, next := splitLine(rest)
-		rest = next
-		if len(line) == 0 {
-			break
-		}
-		text := string(line)
-		switch {
-		case strings.HasPrefix(text, "tree "):
-			if oid, ok := parseOid(strings.TrimSpace(text[5:])); ok {
-				c.tree = oid
+	var commit parsedCommit
+	header := gitHeader{remaining: data}
+	for key, value := range header.fields {
+		switch string(key) {
+		case "tree", "parent":
+			oid, valid := parseOid(string(bytes.TrimSpace(value)))
+			if !valid {
+				continue
 			}
-		case strings.HasPrefix(text, "parent "):
-			if oid, ok := parseOid(strings.TrimSpace(text[7:])); ok {
-				c.parents = append(c.parents, oid)
+			if string(key) == "tree" {
+				commit.tree = oid
+			} else {
+				commit.parents = append(commit.parents, oid)
 			}
-		case strings.HasPrefix(text, "author "):
-			c.author = text[7:]
-		case strings.HasPrefix(text, "committer "):
-			c.committer = text[10:]
+		case "author":
+			commit.author = string(value)
+		case "committer":
+			commit.committer = string(value)
 		}
 	}
-	c.message = string(rest)
-	return c
+	commit.message = string(header.remaining)
+	return &commit
 }
 
 // parseTreeEntries reads a tree object's entries.
 func parseTreeEntries(data []byte) []treeEntry {
-	var out []treeEntry
-	for len(data) > 0 {
-		sp := indexByte(data, ' ')
-		if sp < 0 {
-			break
+	var entries []treeEntry
+	for len(data) != 0 {
+		entry, remaining, ok := readTreeEntry(data)
+		if !ok {
+			return entries
 		}
-		nul := indexByte(data[sp+1:], 0)
-		if nul < 0 || sp+1+nul+20 > len(data) {
-			break
-		}
-		var oid Oid
-		copy(oid[:], data[sp+1+nul+1:sp+1+nul+21])
-		out = append(out, treeEntry{mode: string(data[:sp]), name: string(data[sp+1 : sp+1+nul]), oid: oid})
-		data = data[sp+1+nul+21:]
+		entries = append(entries, entry)
+		data = remaining
 	}
-	return out
+	return entries
+}
+
+func readTreeEntry(data []byte) (treeEntry, []byte, bool) {
+	mode, afterMode, separated := bytes.Cut(data, []byte{' '})
+	if !separated {
+		return treeEntry{}, nil, false
+	}
+	name, afterName, terminated := bytes.Cut(afterMode, []byte{0})
+	if !terminated || len(afterName) < len(ZeroOid) {
+		return treeEntry{}, nil, false
+	}
+	entry := treeEntry{mode: string(mode), name: string(name), oid: Oid(afterName[:len(ZeroOid)])}
+	return entry, afterName[len(ZeroOid):], true
 }
 
 // parseTagHeader reads a tag object's target, type and message.
 func parseTagHeader(data []byte) *parsedTag {
-	t := &parsedTag{}
-	rest := data
-	for len(rest) > 0 {
-		line, next := splitLine(rest)
-		rest = next
-		if len(line) == 0 {
-			break
-		}
-		text := string(line)
-		switch {
-		case strings.HasPrefix(text, "object "):
-			if oid, ok := parseOid(strings.TrimSpace(text[7:])); ok {
-				t.object = oid
+	var tag parsedTag
+	header := gitHeader{remaining: data}
+	for key, value := range header.fields {
+		switch string(key) {
+		case "object":
+			if target, valid := parseOid(string(bytes.TrimSpace(value))); valid {
+				tag.object = target
 			}
-		case strings.HasPrefix(text, "type "):
-			t.objType = strings.TrimSpace(text[5:])
-		case strings.HasPrefix(text, "tag "):
-			t.tag = strings.TrimSpace(text[4:])
+		case "type":
+			tag.objType = string(bytes.TrimSpace(value))
+		case "tag":
+			tag.tag = string(bytes.TrimSpace(value))
 		}
 	}
-	t.message = string(rest)
-	return t
+	tag.message = string(header.remaining)
+	return &tag
 }
 
-func splitLine(b []byte) (line, rest []byte) {
-	if i := indexByte(b, '\n'); i >= 0 {
-		return b[:i], b[i+1:]
-	}
-	return b, nil
+// gitHeader traverses the key/value lines shared by commits and tags. After
+// iteration, remaining contains the message, including its original newlines.
+type gitHeader struct {
+	remaining []byte
 }
 
-func indexByte(b []byte, c byte) int {
-	for i, x := range b {
-		if x == c {
-			return i
+func (h *gitHeader) fields(yield func(key, value []byte) bool) {
+	for len(h.remaining) > 0 {
+		line, tail, _ := bytes.Cut(h.remaining, []byte{'\n'})
+		h.remaining = tail
+		if len(line) == 0 {
+			return
+		}
+		key, value, present := bytes.Cut(line, []byte{' '})
+		if present && !yield(key, value) {
+			return
 		}
 	}
-	return -1
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +275,7 @@ type repository struct {
 
 	objects map[Oid]*gitObject
 	refs    map[string]Oid // full ref name -> oid
+	clones  shallowReplyCache
 
 	issues      []*issue
 	issuesByNum map[int]*issue
@@ -285,7 +285,6 @@ type repository struct {
 
 	seq        int // shared issue/pull-request number counter
 	commentSeq int
-	createdSeq int
 }
 
 func (r *repository) fullName() string { return r.owner + "/" + r.name }
@@ -294,20 +293,30 @@ func (r *repository) fullName() string { return r.owner + "/" + r.name }
 // is the object's hash. Storing the same object twice is a no-op.
 func (r *repository) putObject(typ byte, data []byte) Oid {
 	oid := hashObjectId(typ, data)
-	if _, ok := r.objects[oid]; ok {
-		return oid
+	r.insertObject(oid, typ, data)
+	return oid
+}
+
+func (r *repository) insertObject(oid Oid, typ byte, data []byte) {
+	if r.objects[oid] != nil {
+		return
 	}
-	o := &gitObject{typ: typ, data: data}
+	r.objects[oid] = newGitObject(typ, data)
+	// A new object can complete a tree or tag in a cached reply.
+	r.clones.clear()
+}
+
+func newGitObject(typ byte, data []byte) *gitObject {
+	object := &gitObject{typ: typ, data: data}
 	switch typ {
 	case objCommit:
-		o.commit = parseCommitHeader(data)
+		object.commit = parseCommitHeader(data)
 	case objTree:
-		o.tree = parseTreeEntries(data)
+		object.tree = parseTreeEntries(data)
 	case objTag:
-		o.tag = parseTagHeader(data)
+		object.tag = parseTagHeader(data)
 	}
-	r.objects[oid] = o
-	return oid
+	return object
 }
 
 func (r *repository) object(oid Oid) *gitObject { return r.objects[oid] }
@@ -315,56 +324,65 @@ func (r *repository) object(oid Oid) *gitObject { return r.objects[oid] }
 // peelToCommit follows tag objects until a commit (or a non-tag object) is
 // reached. It answers the peeled oid and whether it is a commit.
 func (r *repository) peelToCommit(oid Oid) (Oid, bool) {
-	for i := 0; i < 64; i++ {
-		o := r.objects[oid]
-		if o == nil {
-			return oid, false
-		}
-		if o.typ == objCommit {
-			return oid, true
-		}
-		if o.typ == objTag && o.tag != nil {
-			oid = o.tag.object
-			continue
-		}
-		return oid, false
-	}
-	return oid, false
+	target, object := r.followTags(oid)
+	return target, object != nil && object.typ == objCommit
 }
 
 // peelTarget follows tag objects to the first non-tag object.
 func (r *repository) peelTarget(oid Oid) Oid {
-	for i := 0; i < 64; i++ {
-		o := r.objects[oid]
-		if o == nil || o.typ != objTag || o.tag == nil {
-			return oid
+	target, _ := r.followTags(oid)
+	return target
+}
+
+// At the traversal limit the final oid is still reportable, but it has not
+// been inspected and does not qualify as a peeled commit.
+func (r *repository) followTags(oid Oid) (Oid, *gitObject) {
+	for range 64 {
+		object := r.objects[oid]
+		if object == nil || object.typ != objTag || object.tag == nil {
+			return oid, object
 		}
-		oid = o.tag.object
+		oid = object.tag.object
 	}
-	return oid
+	return oid, nil
 }
 
 // commitOf answers the parsed commit for an oid, following tags.
 func (r *repository) commitOf(oid Oid) *parsedCommit {
-	peeled, ok := r.peelToCommit(oid)
-	if !ok {
-		return nil
+	_, target := r.followTags(oid)
+	if target != nil && target.typ == objCommit {
+		return target.commit
 	}
-	o := r.objects[peeled]
-	if o == nil {
-		return nil
-	}
-	return o.commit
+	return nil
 }
 
 // refNames returns all ref names in sorted order.
 func (r *repository) refNames() []string {
-	names := make([]string, 0, len(r.refs))
-	for name := range r.refs {
-		names = append(names, name)
+	return sortedKeys(r.refs)
+}
+
+func sortedKeys[V any](values map[string]V) []string { return slices.Sorted(maps.Keys(values)) }
+
+func selectInOrder[T any](source []T, newestFirst bool, accept func(T) bool) []T {
+	var selected []T
+	for i := range source {
+		if newestFirst {
+			i = len(source) - 1 - i
+		}
+		if value := source[i]; accept(value) {
+			selected = append(selected, value)
+		}
 	}
-	sort.Strings(names)
-	return names
+	return selected
+}
+
+func (r *repository) unknownLabel(names []string) (string, bool) {
+	for _, name := range names {
+		if r.labels[name] == nil {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // ---------------------------------------------------------------------------
@@ -373,8 +391,9 @@ func (r *repository) refNames() []string {
 type store struct {
 	mu sync.RWMutex
 
-	repos map[string]*repository // key: owner + "\x00" + name
-	order []*repository          // creation order
+	repos     map[string]*repository // key: owner + "\x00" + name
+	reposByID map[int]*repository
+	byOwner   map[string][]*repository // creation order within each owner
 
 	repoSeq    int // next database id
 	issueIDSeq int // next global issue REST id
@@ -397,6 +416,8 @@ func newStore() *store {
 	viewer := deriveViewer()
 	return &store{
 		repos:       map[string]*repository{},
+		reposByID:   map[int]*repository{},
+		byOwner:     map[string][]*repository{},
 		viewerLogin: viewer.login,
 		viewerName:  viewer.name,
 		viewerEmail: viewer.email,
@@ -411,12 +432,12 @@ func (s *store) nextTime() int64 {
 	return s.timeSeq
 }
 
-// nextRequestID answers a fresh X-GitHub-Request-Id value.
-func (s *store) nextRequestID() string {
-	var buf [24]byte
-	b := append(buf[:0], "req-"...)
-	b = strconv.AppendUint(b, s.reqSeq.Add(1), 10)
-	return string(b)
+func branchRef(name string) string { return "refs/heads/" + name }
+
+func (s *store) commitAsViewer(r *repository, tree Oid, parents []Oid, message string) (Oid, int64) {
+	ts := s.nextTime()
+	identity := s.viewerName + " <" + s.viewerEmail + ">"
+	return r.buildCommitObject(tree, parents, message, identity, identity, ts), ts
 }
 
 // createRepo makes a repository owned by owner. It answers nil when a
@@ -440,10 +461,10 @@ func (s *store) createRepo(owner, name, description string, hasDesc, private boo
 		issuesByNum:   map[int]*issue{},
 		pullsByNum:    map[int]*pullRequest{},
 		labels:        map[string]*label{},
-		createdSeq:    len(s.order),
 	}
 	s.repos[key] = r
-	s.order = append(s.order, r)
+	s.reposByID[r.id] = r
+	s.byOwner[owner] = append(s.byOwner[owner], r)
 	return r
 }
 
@@ -458,24 +479,22 @@ func (s *store) deleteRepo(owner, name string) bool {
 		return false
 	}
 	delete(s.repos, key)
-	for i, cand := range s.order {
-		if cand == r {
-			s.order = append(s.order[:i], s.order[i+1:]...)
-			break
-		}
+	delete(s.reposByID, r.id)
+	owned := s.byOwner[r.owner]
+	if index := slices.Index(owned, r); index >= 0 {
+		owned = slices.Delete(owned, index, index+1)
+	}
+	if len(owned) == 0 {
+		delete(s.byOwner, r.owner)
+	} else {
+		s.byOwner[r.owner] = owned
 	}
 	return true
 }
 
-// reposOf lists the repositories owned by owner, in creation order.
+// reposOf exposes a read-only view of an owner's creation order under the lock.
 func (s *store) reposOf(owner string) []*repository {
-	var out []*repository
-	for _, r := range s.order {
-		if r.owner == owner {
-			out = append(out, r)
-		}
-	}
-	return out
+	return s.byOwner[owner]
 }
 
 // nextNumber answers the next shared issue/pull-request number for a repo.
