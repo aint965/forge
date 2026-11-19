@@ -700,15 +700,37 @@ func parsePush(input []byte) (pushRequest, string) {
 			push.pack = input
 			return push, ""
 		}
-		line, caps, _ := strings.Cut(strings.TrimRight(string(packet.payload), "\n"), "\x00")
-		command, valid := parsePushCommand(line)
+		line := bytes.TrimRight(packet.payload, "\n")
+		var caps []byte
+		line, caps, _ = bytes.Cut(line, []byte{0})
+		command, valid, fast := parsePushCommandFast(line)
+		if !fast {
+			command, valid = parsePushCommand(string(line))
+		}
 		if !valid {
 			return pushRequest{}, "bad command line"
 		}
-		push.sideband = push.sideband || strings.Contains(caps, "side-band-64k")
+		push.sideband = push.sideband || bytes.Contains(caps, []byte("side-band-64k"))
 		push.commands = append(push.commands, command)
 	}
 	return pushRequest{}, "no command list"
+}
+
+// parsePushCommandFast handles the common protocol form without tokenizing or
+// converting the packet line to a string. The general parser below preserves
+// the broader whitespace behavior for non-canonical inputs.
+func parsePushCommandFast(line []byte) (pushCommand, bool, bool) {
+	if len(line) < 87 || line[40] != ' ' || line[81] != ' ' || !bytes.HasPrefix(line[82:], []byte("refs/")) {
+		return pushCommand{}, false, false
+	}
+	for _, c := range line[82:] {
+		if c <= ' ' || c >= 0x7f {
+			return pushCommand{}, false, false
+		}
+	}
+	oldOid, oldOK := parseOidBytes(line[:40])
+	newOid, newOK := parseOidBytes(line[41:81])
+	return pushCommand{oldOid: oldOid, newOid: newOid, ref: string(line[82:])}, oldOK && newOK, true
 }
 
 func parsePushCommand(line string) (pushCommand, bool) {
@@ -794,6 +816,16 @@ func (r *repository) fastForward(oldObj, newObj Oid) bool {
 	newCommit, okNew := r.peelToCommit(newObj)
 	if !okOld || !okNew {
 		return oldObj == newObj
+	}
+	// Receive-pack usually advances the ref by one commit. Check this edge
+	// before allocating the ancestry walk; non-adjacent updates still use the
+	// full graph check below.
+	if object := r.objects[newCommit]; object != nil && object.typ == objCommit && object.commit != nil {
+		for _, parent := range object.commit.parents {
+			if parent == oldCommit {
+				return true
+			}
+		}
 	}
 	return r.isAncestor(oldCommit, newCommit)
 }

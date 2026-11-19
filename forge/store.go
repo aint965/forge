@@ -41,11 +41,15 @@ func (o Oid) IsZero() bool { return o == ZeroOid }
 
 // parseOid decodes 40 lowercase or uppercase hex characters.
 func parseOid(s string) (Oid, bool) {
-	if len(s) != hex.EncodedLen(len(ZeroOid)) {
+	return parseOidBytes([]byte(s))
+}
+
+func parseOidBytes(encoded []byte) (Oid, bool) {
+	if len(encoded) != hex.EncodedLen(len(ZeroOid)) {
 		return ZeroOid, false
 	}
 	var oid Oid
-	_, err := hex.Decode(oid[:], []byte(s))
+	_, err := hex.Decode(oid[:], encoded)
 	if err != nil {
 		return ZeroOid, false
 	}

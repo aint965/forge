@@ -123,6 +123,48 @@ func TestPktLineFramingAcrossSidebandBoundary(t *testing.T) {
 	}
 }
 
+func TestPushCommandFastParserMatchesGeneralParser(t *testing.T) {
+	for _, tc := range []struct {
+		line      string
+		valid     bool
+		fastParse bool
+	}{
+		{strings.Repeat("0", 40) + " " + strings.Repeat("1", 40) + " refs/heads/main", true, true},
+		{" " + strings.Repeat("0", 40) + " " + strings.Repeat("1", 40) + " refs/heads/main", true, false},
+		{strings.Repeat("z", 40) + " " + strings.Repeat("1", 40) + " refs/heads/main", false, true},
+		{strings.Repeat("0", 40) + " " + strings.Repeat("1", 40) + " refs/heads/main extra", false, false},
+	} {
+		fast, valid, handled := parsePushCommandFast([]byte(tc.line))
+		general, generalValid := parsePushCommand(tc.line)
+		if generalValid != tc.valid || handled != tc.fastParse || handled && valid != generalValid {
+			t.Fatalf("fast parser = (%+v, %v, %v), general parser = (%+v, %v) for %q", fast, valid, handled, general, generalValid, tc.line)
+		}
+		if handled && valid && fast != general {
+			t.Fatalf("fast parser = %+v, general parser = %+v for %q", fast, general, tc.line)
+		}
+	}
+}
+
+func TestFastForwardDirectParentAndHistoryFallback(t *testing.T) {
+	r := newStore().createRepo("owner", "history", "", false, false)
+	root := r.buildCommitObject(ZeroOid, nil, "root\n", "author", "committer", 1)
+	middle := r.buildCommitObject(ZeroOid, []Oid{root}, "middle\n", "author", "committer", 2)
+	tip := r.buildCommitObject(ZeroOid, []Oid{middle}, "tip\n", "author", "committer", 3)
+	unrelated := r.buildCommitObject(ZeroOid, nil, "unrelated\n", "author", "committer", 4)
+	for _, tc := range []struct {
+		old, next Oid
+		want      bool
+	}{
+		{middle, tip, true},
+		{root, tip, true},
+		{unrelated, tip, false},
+	} {
+		if got := r.fastForward(tc.old, tc.next); got != tc.want {
+			t.Fatalf("fastForward(%s, %s) = %v, want %v", tc.old, tc.next, got, tc.want)
+		}
+	}
+}
+
 func TestGraphQLTruncationAndFragmentCycleReturnErrors(t *testing.T) {
 	for _, query := range []string{"query Q($a:", "{viewer", "{f(a:[1", "{f(a:{x:", "fragment F on User { login }"} {
 		if _, err := parseGraphQLDocument(query); err == nil {
